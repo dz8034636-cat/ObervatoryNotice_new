@@ -26,8 +26,7 @@
 
 ```text
 ObervatoryNotice/
-├─ app.py                         # 唯一程序入口
-├─ gui.py                         # 或 app.py 实际导入的 PyQt5 GUI 文件
+├─ app.py                         # 唯一程序入口 ，app.py 实际导入的 PyQt5 GUI 文件
 ├─ engine.py                      # 与 core.py 配套的新引擎
 ├─ core.py                        # 配置、模型、数据库
 ├─ hko_data.py
