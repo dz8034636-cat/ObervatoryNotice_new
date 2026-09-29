@@ -1,0 +1,759 @@
+"""PyQt5 告警桌面界面：主页扫码、自动字体、托盘、运行时间。
+依赖同一套重构版 core.py / engine.py / hko_data.py；发送使用原有 WhatsApp 桥接。
+启动：在 appnew.py 中 from gui_pyqt_main_login import main as run_gui。
+"""
+from __future__ import annotations
+
+import base64
+import os
+import queue
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+from PyQt5.QtCore import Qt, QTime, QTimer, QUrl, QObject, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPixmap, QDesktopServices
+from PyQt5.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QSystemTrayIcon,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QTimeEdit,
+    QVBoxLayout, QWidget, QHeaderView,
+)
+
+from core_new import (
+    CATEGORIES, LEVEL_NAMES, Database, GroupConfig, SettingsManager,
+    get_logs_dir, setup_logging,
+)
+from engine_new import AlertEngine, AlertScheduler, worktime
+from whatsapp_bridge_client import WhatsAppBridgeClient
+
+
+def theme(scale: float) -> str:
+    base = 12.0 * scale
+    button = 11.5 * scale
+    return f'''
+    QWidget {{font-family: "Segoe UI", "Microsoft YaHei UI", Arial;
+              font-size: {base:.1f}pt; color: #202733; background: #f6f7fa;}}
+    QMainWindow, QDialog {{background: #f6f7fa;}}
+    QTabWidget::pane {{border: 0;}}
+    QTabBar::tab {{background: transparent; border: 0; padding: 12px 19px;
+                   color: #667085;}}
+    QTabBar::tab:selected {{color: #2466ce; border-bottom: 2px solid #2466ce;}}
+    QGroupBox {{background: white; border: 1px solid #e4e8ef; border-radius: 12px;
+                margin-top: 17px; padding: 16px; font-weight: 600;}}
+    QGroupBox::title {{subcontrol-origin: margin; left: 14px;
+                       background: white; padding: 0 5px;}}
+    QLabel#pageTitle {{font-size: {20 * scale:.1f}pt; font-weight: 700;}}
+    QLabel#statusLabel {{color: #2563eb; font-weight: 600;}}
+    QPushButton {{background: white; border: 1px solid #d6dce7; border-radius: 8px;
+                  padding: 8px 13px; font-size: {button:.1f}pt;}}
+    QPushButton:hover {{background: #eef4ff;}}
+    QPushButton#primary {{background: #2466ce; border-color: #2466ce; color: white;}}
+    QPushButton#primary:hover {{background: #1e57b0;}}
+    QLineEdit, QComboBox, QTimeEdit, QSpinBox {{background: white;
+                border: 1px solid #d6dce7; border-radius: 7px; padding: 6px;}}
+    QTableWidget, QTextEdit {{background: white; border: 1px solid #e4e8ef;
+                              border-radius: 9px; selection-background-color: #dceafe;}}
+    QScrollArea {{border: 0;}}
+    '''
+
+
+def app_icon() -> QIcon:
+    pix = QPixmap(64, 64)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor('#2466ce'))
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
+    painter.setPen(QColor('white'))
+    painter.drawText(pix.rect(), Qt.AlignCenter, '!')
+    painter.end()
+    return QIcon(pix)
+
+
+def startup_file() -> Path | None:
+    root = os.environ.get('APPDATA')
+    if os.name != 'nt' or not root:
+        return None
+    return Path(root) / 'Microsoft/Windows/Start Menu/Programs/Startup/WeatherAlert.cmd'
+
+
+def configure_startup(enabled: bool) -> None:
+    file = startup_file()
+    if file is None:
+        if enabled:
+            raise RuntimeError('本版本仅在 Windows 支持登录后自启动。')
+        return
+    if not enabled:
+        file.unlink(missing_ok=True)
+        return
+    executable = Path(sys.executable).resolve()
+    if getattr(sys, 'frozen', False):
+        command = f'"{executable}" --minimized'
+    else:
+        pythonw = executable.with_name('pythonw.exe')
+        if pythonw.exists():
+            executable = pythonw
+        entry = Path(sys.argv[0]).resolve()
+        command = f'"{executable}" "{entry}" --minimized'
+    file.write_text('@echo off\nstart "" ' + command + '\n', encoding='utf-8')
+
+
+class WorkerSignals(QObject):
+    completed = pyqtSignal(str, object)
+
+
+def form_row(title: str, control: QWidget) -> QWidget:
+    box = QWidget()
+    layout = QHBoxLayout(box)
+    layout.setContentsMargins(0, 0, 0, 0)
+    caption = QLabel(title)
+    caption.setMinimumWidth(140)
+    layout.addWidget(caption)
+    layout.addWidget(control, 1)
+    return box
+
+
+class GroupEditor(QDialog):
+    def __init__(self, parent: QWidget, group: GroupConfig | None, names: list[str]):
+        super().__init__(parent)
+        self.group = group or GroupConfig()
+        self.setWindowTitle('群组与警告订阅')
+        self.resize(610, 660)
+        outer = QVBoxLayout(self)
+        outer.addWidget(QLabel('请选择 WhatsApp 精确群组名称及要接收的警告。'))
+        self.name = QComboBox()
+        self.name.setEditable(True)
+        self.name.addItems(sorted(set(names + [self.group.whatsapp_exact_name]) - {''}))
+        self.name.setCurrentText(self.group.whatsapp_exact_name)
+        outer.addWidget(form_row('群组精确名称', self.name))
+        self.enabled = QCheckBox('启用群组')
+        self.enabled.setChecked(self.group.enabled)
+        self.round_clock = QCheckBox('24/7 接收（默认关闭）')
+        self.round_clock.setChecked(self.group.is_24x7)
+        outer.addWidget(self.enabled)
+        outer.addWidget(self.round_clock)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        grid = QVBoxLayout(body)
+        names_by_category = {
+            'tropical_cyclone': '热带气旋',
+            'rainstorm': '暴雨',
+            'heat_stress_work': '劳工处工作暑热',
+            'hot_weather': '天文台酷热天气',
+        }
+        self.level_checks: dict[str, QCheckBox] = {}
+        for category in names_by_category:
+            section = QGroupBox(names_by_category[category])
+            section_grid = QGridLayout(section)
+            for index, level in enumerate(CATEGORIES[category]):
+                check = QCheckBox(LEVEL_NAMES[level])
+                check.setChecked(bool(self.group.subscriptions.get(level, False)))
+                section_grid.addWidget(check, index // 2, index % 2)
+                self.level_checks[level] = check
+            grid.addWidget(section)
+        grid.addStretch()
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        controls = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        controls.accepted.connect(self.save)
+        controls.rejected.connect(self.reject)
+        outer.addWidget(controls)
+
+    def save(self) -> None:
+        name = self.name.currentText().strip()
+        if not name or not any(c.isChecked() for c in self.level_checks.values()):
+            QMessageBox.warning(self, '填写不完整', '请填写群组精确名称，并至少勾选一种警告。')
+            return
+        self.group.whatsapp_exact_name = name
+        self.group.display_name = name
+        self.group.enabled = self.enabled.isChecked()
+        self.group.is_24x7 = self.round_clock.isChecked()
+        self.group.subscriptions = {
+            level: check.isChecked() for level, check in self.level_checks.items()
+        }
+        self.accept()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, minimized: bool = False):
+        super().__init__()
+        setup_logging()
+        self.settings = SettingsManager()
+        self.db = Database()
+        self.events = queue.Queue()
+        self.start_clock = time.monotonic()
+        self.signals = WorkerSignals()
+        self.signals.completed.connect(self.on_worker_complete)
+        self.names: list[str] = []
+        self._auth_busy = False
+        self._loading_bridge = False
+        self._quitting = False
+        self._restart_required = False
+        self._theme_scale = 0.0
+        s = self.settings.settings
+        self.sender = WhatsAppBridgeClient(
+            chrome_profile_dir=Path(s.chrome_profile_dir),
+            dry_run=s.dry_run_mode,
+            headless=True,
+        )
+        self.engine = AlertEngine(self.db, self.settings, self.sender)
+        self.scheduler = AlertScheduler(self.engine, self.settings, self.events)
+        self.setWindowTitle('天气警告通知')
+        self.setWindowIcon(app_icon())
+        self.resize(1060, 760)
+        self.setMinimumSize(850, 630)
+        self.build()
+        self.setup_tray()
+        self.queue_timer = QTimer(self)
+        self.queue_timer.timeout.connect(self.drain_events)
+        self.queue_timer.start(300)
+        self.runtime_timer = QTimer(self)
+        self.runtime_timer.timeout.connect(self.update_runtime)
+        self.runtime_timer.start(1000)
+        self.qr_timer = QTimer(self)
+        self.qr_timer.timeout.connect(self.poll_auth)
+        self.update_runtime()
+        if not minimized:
+            self.show()
+        elif self.tray is None:
+            self.showMinimized()
+        if s.auto_start_monitor:
+            if s.dry_run_mode:
+                self.scheduler.start()
+            else:
+                QTimer.singleShot(0, self.start_whatsapp)
+
+    def build(self) -> None:
+        s = self.settings.settings
+        tabs = QTabWidget()
+        self.setCentralWidget(tabs)
+        dashboard, groups, history, settings = QWidget(), QWidget(), QWidget(), QWidget()
+        for page, name in ((dashboard, '监控'), (groups, '群组'),
+                           (history, '记录'), (settings, '设置')):
+            tabs.addTab(page, name)
+        main = QVBoxLayout(dashboard)
+        main.setContentsMargins(24, 20, 24, 20)
+        header = QHBoxLayout()
+        self.title = QLabel('天气警告监控')
+        self.title.setObjectName('pageTitle')
+        header.addWidget(self.title)
+        header.addStretch()
+        self.run_status = QLabel('未启动')
+        self.run_status.setObjectName('statusLabel')
+        header.addWidget(self.run_status)
+        main.addLayout(header)
+        self.work_status = QLabel('正在检查工作时间规则…')
+        self.uptime = QLabel('本次运行：00:00:00')
+        self.last_check = QLabel('上次查询：—')
+        main.addWidget(self.work_status)
+        line = QHBoxLayout()
+        for widget in (self.uptime, self.last_check):
+            line.addWidget(widget)
+        line.addStretch()
+        main.addLayout(line)
+        controls = QHBoxLayout()
+        for caption, handler in (
+            ('开始监控', self.start_monitor),
+            ('立即检查', self.check_now),
+            ('暂停 / 继续', self.toggle_monitor),
+            ('最小化运行', self.minimize_to_tray),
+            ('退出程序', self.exit_app),
+        ):
+            button = QPushButton(caption)
+            button.clicked.connect(handler)
+            controls.addWidget(button)
+        controls.addStretch()
+        main.addLayout(controls)
+        wa_card = QGroupBox('WhatsApp 登录 · 主页面')
+        wa_layout = QVBoxLayout(wa_card)
+        top = QHBoxLayout()
+        self.login_status = QLabel('未检测登录')
+        top.addWidget(self.login_status, 1)
+        self.login_button = QPushButton('启动 / 扫码登录')
+        self.login_button.setObjectName('primary')
+        self.login_button.clicked.connect(self.start_whatsapp)
+        top.addWidget(self.login_button)
+        check_button = QPushButton('检查登录')
+        check_button.clicked.connect(self.poll_auth)
+        top.addWidget(check_button)
+        wa_layout.addLayout(top)
+        self.qr_box = QWidget()
+        qr_line = QHBoxLayout(self.qr_box)
+        self.qr_picture = QLabel('等待二维码…')
+        self.qr_picture.setAlignment(Qt.AlignCenter)
+        self.qr_picture.setMinimumSize(240, 240)
+        qr_line.addWidget(self.qr_picture)
+        qr_description = QVBoxLayout()
+        note = QLabel('请用 WhatsApp 手机端扫码。\n登录成功后二维码会自动隐藏；\n桥接继续在后台运行。')
+        note.setWordWrap(True)
+        qr_description.addWidget(note)
+        hide_button = QPushButton('隐藏二维码（不退出登录）')
+        hide_button.clicked.connect(self.hide_qr)
+        qr_description.addWidget(hide_button)
+        qr_description.addStretch()
+        qr_line.addLayout(qr_description, 1)
+        wa_layout.addWidget(self.qr_box)
+        self.qr_box.hide()
+        main.addWidget(wa_card)
+        main.addWidget(QLabel('最近检查与发送结果'))
+        self.recent = QTextEdit()
+        self.recent.setReadOnly(True)
+        main.addWidget(self.recent, 1)
+
+        gl = QVBoxLayout(groups)
+        gl.setContentsMargins(24, 20, 24, 20)
+        self.group_table = QTableWidget(0, 4)
+        self.group_table.setHorizontalHeaderLabels(['群组名称', '警告种类数', '接收时间', '启用'])
+        self.group_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.group_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.group_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        gl.addWidget(self.group_table)
+        group_actions = QHBoxLayout()
+        for caption, handler in (
+            ('读取 WhatsApp 群组', self.load_groups),
+            ('新增', self.add_group),
+            ('编辑', self.edit_group),
+            ('删除', self.delete_group),
+        ):
+            button = QPushButton(caption)
+            button.clicked.connect(handler)
+            group_actions.addWidget(button)
+        group_actions.addStretch()
+        gl.addLayout(group_actions)
+        self.group_hint = QLabel('群组发送使用 WhatsApp 精确名称；请先登录再读取群组。')
+        gl.addWidget(self.group_hint)
+        self.refresh_groups()
+
+        hl = QVBoxLayout(history)
+        hl.setContentsMargins(24, 20, 24, 20)
+        self.history_table = QTableWidget(0, 6)
+        self.history_table.setHorizontalHeaderLabels(
+            ['查询时间', '群组', '警告', '结果', '照片', '故障代码']
+        )
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        hl.addWidget(self.history_table)
+        hb = QHBoxLayout()
+        reload_button = QPushButton('刷新记录')
+        reload_button.clicked.connect(self.refresh_history)
+        hb.addWidget(reload_button)
+        log_button = QPushButton('打开日志目录')
+        log_button.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_logs_dir())))
+        )
+        hb.addWidget(log_button)
+        hb.addStretch()
+        hl.addLayout(hb)
+        self.refresh_history()
+
+        sl = QVBoxLayout(settings)
+        sl.setContentsMargins(24, 20, 24, 20)
+        hours = QGroupBox('工作时间（香港时间）')
+        hours_layout = QVBoxLayout(hours)
+        day_row = QHBoxLayout()
+        self.days: list[QCheckBox] = []
+        for index, label in enumerate('一二三四五六日'):
+            check = QCheckBox(label)
+            check.setChecked(index in s.workdays)
+            day_row.addWidget(check)
+            self.days.append(check)
+        hours_layout.addLayout(day_row)
+        times = QHBoxLayout()
+        self.start_time = QTimeEdit()
+        self.start_time.setDisplayFormat('HH:mm')
+        self.start_time.setTime(QTime.fromString(s.work_start_time, 'HH:mm'))
+        self.end_time = QTimeEdit()
+        self.end_time.setDisplayFormat('HH:mm')
+        self.end_time.setTime(QTime.fromString(s.work_end_time, 'HH:mm'))
+        times.addWidget(QLabel('开始'))
+        times.addWidget(self.start_time)
+        times.addWidget(QLabel('结束'))
+        times.addWidget(self.end_time)
+        hours_layout.addLayout(times)
+        sl.addWidget(hours)
+        self.interval = QSpinBox()
+        self.interval.setRange(1, 60)
+        self.interval.setValue(s.poll_interval_minutes)
+        sl.addWidget(form_row('查询间隔（分钟）', self.interval))
+        self.retry_count = QSpinBox()
+        self.retry_count.setRange(1, 10)
+        self.retry_count.setValue(s.retry_failed_delivery_max_attempts)
+        sl.addWidget(form_row('每轮尝试上限', self.retry_count))
+        self.demo_mode = QCheckBox('演示模式（不会真实发送）')
+        self.demo_mode.setChecked(s.dry_run_mode)
+        sl.addWidget(self.demo_mode)
+        self.auto_monitor = QCheckBox('启动程序时开启监控')
+        self.auto_monitor.setChecked(s.auto_start_monitor)
+        sl.addWidget(self.auto_monitor)
+        self.auto_start = QCheckBox('Windows 登录后自启动并最小化')
+        self.auto_start.setEnabled(startup_file() is not None)
+        file = startup_file()
+        self.auto_start.setChecked(bool(file and file.exists()))
+        sl.addWidget(self.auto_start)
+        sl.addWidget(QLabel('仅明确设为 24/7 的群组可在非工作时间查询与接收。'))
+        save_button = QPushButton('保存设置')
+        save_button.setObjectName('primary')
+        save_button.clicked.connect(self.save_settings)
+        sl.addWidget(save_button)
+        sl.addStretch()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        width = max(850, self.width())
+        scale = 0.98 if width < 1000 else 1.08 if width >= 1300 else 1.0
+        if scale != self._theme_scale:
+            self._theme_scale = scale
+            self.setStyleSheet(theme(scale))
+
+    def setup_tray(self) -> None:
+        self.tray: QSystemTrayIcon | None = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(app_icon(), self)
+        menu = QMenu(self)
+        menu.addAction('显示主窗口', self.restore_window)
+        menu.addAction('立即检查', self.check_now)
+        menu.addSeparator()
+        menu.addAction('退出程序', self.exit_app)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda reason: self.restore_window()
+            if reason == QSystemTrayIcon.Trigger else None
+        )
+        self.tray.show()
+
+    def restore_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def minimize_to_tray(self) -> None:
+        if self.tray is None:
+            self.showMinimized()
+        else:
+            self.hide()
+
+    def closeEvent(self, event) -> None:
+        if self._quitting:
+            event.accept()
+        else:
+            event.ignore()
+            self.minimize_to_tray()
+
+    def exit_app(self) -> None:
+        self.scheduler.stop()
+        thread = self.scheduler._thread
+        if thread is not None and thread.is_alive():
+            QMessageBox.warning(self, '仍在发送', '当前检查尚未完成，请稍后再退出。')
+            return
+        self.qr_timer.stop()
+        try:
+            self.sender.quit()
+        except Exception as exc:
+            self.recent.append(f'关闭桥接时发生异常：{exc}')
+        self._quitting = True
+        QApplication.instance().quit()
+
+    def run_worker(self, kind: str, operation) -> None:
+        def work() -> None:
+            try:
+                result = operation()
+                self.signals.completed.emit(kind, result)
+            except Exception as exc:
+                self.signals.completed.emit(kind, exc)
+        threading.Thread(target=work, name=f'gui-{kind}', daemon=True).start()
+
+    def start_whatsapp(self) -> None:
+        if self._restart_required:
+            self.login_status.setText('设置已变更，请重启应用。')
+            return
+        if self.settings.settings.dry_run_mode:
+            self.login_status.setText('演示模式不会启动真实桥接；请关闭演示模式并重启。')
+            return
+        if self._loading_bridge:
+            return
+        if not self.engine._busy.acquire(blocking=False):
+            self.login_status.setText('正在执行一轮查询，请稍后登录。')
+            return
+        self._loading_bridge = True
+        self.login_button.setEnabled(False)
+        self.login_status.setText('正在启动 WhatsApp 桥接…')
+
+        def boot():
+            try:
+                self.sender.start_browser()
+                return True
+            finally:
+                self.engine._busy.release()
+        self.run_worker('bridge_start', boot)
+
+    def poll_auth(self) -> None:
+        if self._auth_busy or self._loading_bridge or self._restart_required:
+            return
+        if self.settings.settings.dry_run_mode:
+            self.login_status.setText('演示模式；没有真实 WhatsApp 登录。')
+            return
+        if not self.sender.is_browser_alive():
+            self.login_status.setText('桥接未运行；请点击“启动 / 扫码登录”。')
+            self.qr_timer.stop()
+            return
+        self._auth_busy = True
+
+        def fetch():
+            logged_in = self.sender.is_logged_in(timeout=2)
+            qr = None if logged_in else self.sender.get_login_qr_data_url()
+            return logged_in, qr
+        self.run_worker('auth', fetch)
+
+    def on_worker_complete(self, kind: str, result: object) -> None:
+        if kind == 'bridge_start':
+            self._loading_bridge = False
+            self.login_button.setEnabled(True)
+            if isinstance(result, Exception):
+                self.login_status.setText(f'桥接启动失败：{type(result).__name__} · {result}')
+                return
+            self.login_status.setText('桥接已启动，正在读取登录状态…')
+            self.qr_box.show()
+            self.qr_timer.start(3000)
+            self.poll_auth()
+            return
+        if kind == 'auth':
+            self._auth_busy = False
+            if isinstance(result, Exception):
+                self.login_status.setText(f'登录检查失败：{type(result).__name__} · {result}')
+                return
+            logged_in, data_url = result
+            if logged_in:
+                self.login_status.setText('WhatsApp 已登录 · 桥接在后台运行')
+                self.qr_timer.stop()
+                self.qr_box.hide()
+                if self.settings.settings.auto_start_monitor and not self._restart_required:
+                    self.scheduler.start()
+                return
+            self.login_status.setText('等待扫码登录')
+            if not data_url:
+                self.qr_picture.setText('二维码准备中，请稍候…')
+                return
+            try:
+                if not data_url.startswith('data:image/') or ',' not in data_url:
+                    raise ValueError('桥接返回非图片 data URL')
+                image_bytes = base64.b64decode(data_url.split(',', 1)[1], validate=True)
+                pix = QPixmap()
+                if not pix.loadFromData(image_bytes):
+                    raise ValueError('无法解码二维码图片')
+                self.qr_picture.setPixmap(
+                    pix.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+                self.qr_box.show()
+            except Exception as exc:
+                self.qr_picture.setText(f'二维码显示失败：{exc}')
+            return
+        if kind == 'groups':
+            if isinstance(result, Exception):
+                self.group_hint.setText(f'读取群组失败：{type(result).__name__} · {result}')
+                return
+            self.names = sorted({
+                str(group.get('name', '')).strip()
+                for group in result if group.get('name')
+            })
+            self.group_hint.setText(f'已读取 {len(self.names)} 个群组，可在新增／编辑窗口选择。')
+
+    def hide_qr(self) -> None:
+        self.qr_box.hide()
+        self.qr_timer.stop()
+        self.login_status.setText('二维码已隐藏；桥接仍在运行。点击检查登录可刷新状态。')
+
+    def start_monitor(self) -> None:
+        if self._restart_required:
+            QMessageBox.warning(self, '需要重启', '发送模式已修改，请重启应用后监控。')
+            return
+        if not self.settings.settings.dry_run_mode and not self.sender.is_logged_in(timeout=2):
+            self.login_status.setText('请先在主页面完成 WhatsApp 登录。')
+            self.start_whatsapp()
+            return
+        self.scheduler.start()
+
+    def check_now(self) -> None:
+        if self._restart_required:
+            QMessageBox.warning(self, '需要重启', '请重启应用后检查。')
+            return
+        if not self.settings.settings.dry_run_mode and not self.sender.is_logged_in(timeout=2):
+            self.login_status.setText('请先完成 WhatsApp 登录。')
+            return
+        self.scheduler.trigger_immediate_check()
+
+    def toggle_monitor(self) -> None:
+        if self.scheduler._paused.is_set():
+            self.scheduler.resume()
+        else:
+            self.scheduler.pause()
+
+    def update_runtime(self) -> None:
+        seconds = max(0, int(time.monotonic() - self.start_clock))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        self.uptime.setText(f'本次运行：{hours:02d}:{minutes:02d}:{seconds:02d}')
+        try:
+            state = '工作时间 · 常规查询启用' if worktime(self.settings.settings) else '非工作时间 · 仅 24/7 订阅查询'
+        except ValueError:
+            state = '工作时间配置无效'
+        self.work_status.setText(state)
+
+    def drain_events(self) -> None:
+        try:
+            while True:
+                item = self.events.get_nowait()
+                kind, data = item['type'], item['payload']
+                if kind == 'scheduler_status':
+                    self.run_status.setText({
+                        'RUNNING': '监控中', 'PAUSED': '已暂停', 'IDLE': '未启动'
+                    }.get(data, str(data)))
+                elif kind == 'progress':
+                    self.recent.append(str(data))
+                elif kind == 'check_error':
+                    self.recent.append(f'查询异常：{data}')
+                elif kind == 'check_completed':
+                    completed_at = datetime.fromisoformat(item['time'])
+                    display_time = completed_at.strftime('%Y-%m-%d %H:%M:%S')
+
+                    for result in data:
+                        self.recent.append(str(result))
+
+                    self.recent.append(f'本轮查询完成：{display_time}')
+                    self.last_check.setText(f'上次查询：{display_time}')
+                    self.refresh_history()
+        except queue.Empty:
+            pass
+
+    def refresh_groups(self) -> None:
+        groups = self.db.list_groups()
+        self.group_table.setRowCount(len(groups))
+        for index, group in enumerate(groups):
+            self.group_table.setVerticalHeaderItem(index, QTableWidgetItem(str(group.group_id)))
+            cells = (
+                group.display_name,
+                str(sum(bool(value) for value in group.subscriptions.values())),
+                '24/7' if group.is_24x7 else '工作时间',
+                '是' if group.enabled else '否',
+            )
+            for column, value in enumerate(cells):
+                self.group_table.setItem(index, column, QTableWidgetItem(value))
+
+    def selected_group(self) -> GroupConfig | None:
+        index = self.group_table.currentRow()
+        if index < 0:
+            return None
+        group_id = int(self.group_table.verticalHeaderItem(index).text())
+        return next((g for g in self.db.list_groups() if g.group_id == group_id), None)
+
+    def edit_group_dialog(self, group: GroupConfig | None) -> None:
+        dialog = GroupEditor(self, group, self.names)
+        if dialog.exec_() == QDialog.Accepted:
+            self.db.save_group(dialog.group)
+            self.refresh_groups()
+
+    def add_group(self) -> None:
+        self.edit_group_dialog(None)
+
+    def edit_group(self) -> None:
+        group = self.selected_group()
+        if group is not None:
+            self.edit_group_dialog(group)
+
+    def delete_group(self) -> None:
+        group = self.selected_group()
+        if group is None:
+            return
+        if QMessageBox.question(self, '确认删除', f'删除群组“{group.display_name}”的订阅？') == QMessageBox.Yes:
+            self.db.delete_group(group.group_id)
+            self.refresh_groups()
+
+    def load_groups(self) -> None:
+        if self.settings.settings.dry_run_mode:
+            self.group_hint.setText('当前为演示模式；读取到的将是模拟群组。')
+        if not self.engine._busy.acquire(blocking=False):
+            self.group_hint.setText('查询正在进行，请稍后重试。')
+            return
+
+        def fetch():
+            try:
+                return self.sender.list_groups('')
+            finally:
+                self.engine._busy.release()
+        self.group_hint.setText('正在从 WhatsApp 读取群组…')
+        self.run_worker('groups', fetch)
+
+    def refresh_history(self) -> None:
+        records = self.db.recent_deliveries()
+        self.history_table.setRowCount(len(records))
+        for index, record in enumerate(records):
+            cells = (
+                record['checked_at'],
+                record['display_name'] or str(record['group_id']),
+                record['level'], record['status'],
+                record['photo_status'], record['fault_code'],
+            )
+            for column, value in enumerate(cells):
+                self.history_table.setItem(index, column, QTableWidgetItem(str(value)))
+
+    def save_settings(self) -> None:
+        if self.start_time.time() >= self.end_time.time():
+            QMessageBox.warning(self, '工作时间', '结束时间应晚于开始时间。')
+            return
+        days = [i for i, check in enumerate(self.days) if check.isChecked()]
+        if not days:
+            QMessageBox.warning(self, '工作时间', '请至少选择一个工作日。')
+            return
+        old_demo = self.settings.settings.dry_run_mode
+        new_demo = self.demo_mode.isChecked()
+        if old_demo and not new_demo:
+            answer = QMessageBox.question(
+                self, '确认真实发送',
+                '关闭演示模式后，重启应用并登录 WhatsApp，将开始真实发送。继续？'
+            )
+            if answer != QMessageBox.Yes:
+                self.demo_mode.setChecked(True)
+                return
+        try:
+            configure_startup(self.auto_start.isChecked())
+            self.settings.update(
+                work_hours_enabled=True,
+                workdays=days,
+                work_start_time=self.start_time.time().toString('HH:mm'),
+                work_end_time=self.end_time.time().toString('HH:mm'),
+                poll_interval_minutes=self.interval.value(),
+                retry_failed_delivery_max_attempts=self.retry_count.value(),
+                dry_run_mode=new_demo,
+                auto_start_monitor=self.auto_monitor.isChecked(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, '设置保存失败', str(exc))
+            return
+        if old_demo != new_demo:
+            self._restart_required = True
+            self.scheduler.pause()
+            QMessageBox.information(self, '请重启应用', '发送模式已保存。为避免新旧桥接状态混用，请退出并重新打开应用。')
+        else:
+            QMessageBox.information(self, '已保存', '设置已保存。')
+
+
+def main() -> int:
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    app.setQuitOnLastWindowClosed(False)
+    font = QFont('Segoe UI')
+    font.setPointSizeF(11.0)
+    app.setFont(font)
+    window = MainWindow(minimized='--minimized' in sys.argv)
+    return app.exec_()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

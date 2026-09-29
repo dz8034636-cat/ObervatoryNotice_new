@@ -1,0 +1,5 @@
+2026/08/07-22:25:11.320 8718 Creating DB C:\Users\Administrator\PycharmProjects\ObervatoryNotice\whatsapp_bridge\.wwebjs_auth\session\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb since it was missing.
+2026/08/07-22:25:11.329 8718 Reusing MANIFEST C:\Users\Administrator\PycharmProjects\ObervatoryNotice\whatsapp_bridge\.wwebjs_auth\session\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/08/16-22:39:18.358 8718 Level-0 table #5: started
+2026/08/16-22:39:18.369 8718 Level-0 table #5: 1101112 bytes OK
+2026/08/16-22:39:18.371 8718 Delete type=0 #3

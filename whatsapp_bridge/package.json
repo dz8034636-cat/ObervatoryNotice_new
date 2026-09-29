@@ -1,0 +1,17 @@
+{
+  "name": "hko-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "HKO 告警通知工具的 WhatsApp Web 桥接服务（基于 whatsapp-web.js），供 Python GUI 通过本地 HTTP 调用。",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.34.7"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
