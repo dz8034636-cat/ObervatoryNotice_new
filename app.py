@@ -1,7 +1,4 @@
-"""PyQt5 告警桌面界面：主页扫码、自动字体、托盘、运行时间。
-依赖同一套重构版 core.py / engine.py / hko_data.py；发送使用原有 WhatsApp 桥接。
-启动：在 appnew.py 中 from gui_pyqt_main_login import main as run_gui。
-"""
+
 from __future__ import annotations
 
 import base64
