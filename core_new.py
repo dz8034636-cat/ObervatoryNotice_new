@@ -156,6 +156,8 @@ class Database:
                   attempted_at TEXT NOT NULL, attempts INTEGER NOT NULL,
                   UNIQUE(category,issue_key,group_id));
                 CREATE INDEX IF NOT EXISTS ix_deliveries_recent ON deliveries(id DESC);
+                CREATE TABLE IF NOT EXISTS ui_state (
+                  key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS daily_text_sends (
                   category TEXT NOT NULL, issue_key TEXT NOT NULL, group_id INTEGER NOT NULL,
                   send_day TEXT NOT NULL, sent_at TEXT NOT NULL, status TEXT NOT NULL,
@@ -265,5 +267,32 @@ class Database:
                                  ORDER BY send_day DESC LIMIT 1''',(category,issue_key,group_id)).fetchone()
     def recent_deliveries(self,limit=100):
         with self._lock,self.conn() as db:
-            return db.execute('''SELECT d.*,g.display_name FROM deliveries d LEFT JOIN alert_groups g ON d.group_id=g.group_id
-                                  ORDER BY d.id DESC LIMIT ?''',(limit,)).fetchall()
+            row = db.execute("SELECT value FROM ui_state WHERE key='history_cleared_at'").fetchone()
+            cleared_at = row['value'] if row else ''
+            sql = ("SELECT d.*,g.display_name FROM deliveries d "
+                   "LEFT JOIN alert_groups g ON d.group_id=g.group_id "
+                   "WHERE d.attempted_at > ? ORDER BY d.id DESC LIMIT ?")
+            return db.execute(sql,(cleared_at,limit)).fetchall()
+
+    def clear_history_view(self):
+        # 只清空"记录"页显示；不删除任何数据，因此不影响去重和跨日重发。
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        stamp = datetime.now(ZoneInfo('Asia/Hong_Kong')).isoformat(timespec='seconds')
+        sql = ("INSERT INTO ui_state(key,value) VALUES('history_cleared_at',?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        with self._lock,self.conn() as db:
+            db.execute(sql,(stamp,))
+        return stamp
+
+    def purge_old_records(self,keep_days=3):
+        # 真正删除旧记录。至少保留最近 2 天：跨日重发需要"昨天已发"的记录。
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        keep_days = max(2, int(keep_days))
+        today = datetime.now(ZoneInfo('Asia/Hong_Kong')).date()
+        cutoff = (today - timedelta(days=keep_days)).isoformat()
+        with self._lock,self.conn() as db:
+            deliveries = db.execute("DELETE FROM deliveries WHERE substr(attempted_at,1,10) < ?",(cutoff,)).rowcount
+            daily = db.execute("DELETE FROM daily_text_sends WHERE send_day < ?",(cutoff,)).rowcount
+        return deliveries, daily
