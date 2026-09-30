@@ -1,280 +1,563 @@
-# 天气警告通知工具：操作与方法调用指南
+# 天气警告 WhatsApp 通知工具 README
 
-> **文档版本说明。** 本指南按你最新确认的方案编写：一个 `app.py` 入口、PyQt5 GUI、WhatsApp 登录及二维码放在监控首页、独立警告订阅、酷热天气图标、Windows 优先。此前上传到对话的 `app.py`／`gui.py`／`engine.py`／`core.py` 仍是较早代码；本指南中标为“新版”的函数表对应对话交付的重构实现和你已描述的本机修改，**不是对未上传的本机最新版做过逐行审计**。`hko_data.py`、`whatsapp_service.py` 和 `whatsapp_bridge_client.py` 部分则依据已上传源码。若你需要与本机所有 `def` 逐字逐项一致，请用本文末尾的清单命令核对并提供最终文件。
+香港天文台（HKO）／劳工处（HSWW）天气警告 → 按群组订阅、工作时间与 24/7 规则 → 通过 WhatsApp Bridge 发送文字与图片。Windows 优先，界面为 PyQt5。
 
-## 1. 功能概览
+> 依据：`app.py`、`core_new.py`、`engine_new.py`、`hko_data.py`、`whatsapp_service.py`、`whatsapp_bridge_client.py`、`server.js`，以及本对话中确认的规则。
+> 部分上传文件有截断，函数清单以 9.3 的静态命令在本机重新生成为准。
 
-程序在符合工作时间的条件下查询香港天文台警告和劳工处工作暑热警告。按各 WhatsApp 群组勾选的警告等级分别发送文字及相应 PNG 卡片；同轮两条警告发送两条消息。无 24/7 群组时，非工作时间不调用警告 API；明确设为 24/7 的群组可以在非工作时间接收其订阅的警告。
+---
 
-发送内容由 `whatsapp_service.build_warning_message()` 和 `generate_alert_card()` 创建；实际传输由 `WhatsAppBridgeClient.send_text_and_image()` 完成，**不使用** `whatsapp_service.WhatsAppSender` 的 Selenium 发送器。警告消息只显示来源时间，不显示查询时间或 `+08:00`；GUI 每轮检查完成后显示完成时间。
+## 1. 重要：WhatsApp Bridge 是改动过的版本
+
+**`whatsapp_bridge/server.js` 已被修改，普通的 whatsapp-web.js 示例 `.js` 不能替代它。** Python 端依赖它的接口和环境变量：
+
+| 项目 | 约定 |
+|---|---|
+| 启动 | `node server.js`（工作目录 `whatsapp_bridge/`） |
+| 环境变量 | `PORT`、`SESSION_PATH`、`HEADLESS` |
+| 会话 | `LocalAuth({ dataPath: SESSION_PATH })`，实际资料在 `SESSION_PATH\session\` |
+| 监听 | 仅 `127.0.0.1` |
+| 接口 | `/status`、`/qr`、`/list_groups`、`/verify_group`、`/send`、`/shutdown` |
+| `/status` 字段 | `status`、`detail`、`has_qr`、`session_path`、`headless` 等 |
+| `status` 取值 | `STARTING`、`QR_PENDING`、`AUTHENTICATED`、`CONNECTED`、`READY`、`AUTH_FAILURE`、`DISCONNECTED`、`ERROR` |
+| `/send` 回传 | `SENT`＝文字成功（带图片时图片也成功）；`SENT_TEXT_ONLY`＝文字已发、图片失败；`FAILED`＝失败 |
+| `/shutdown` | 回复 `{ok:true}` → `client.destroy()` → `process.exit(0)`，Chromium 与 Node 一并关闭 |
+
+`server.js` 的改动要点：`/list_groups`、`/verify_group`、`/send` 绕开 `client.getChats()`，直接读 `WAWebCollections.Chat`；认证后 12 秒未收到 `ready` 会检查页面并兜底设为 `READY`；群组名必须**精确匹配**。
+
+**部署与备份：**
+
+1. 必须复制**整个 `whatsapp_bridge/` 文件夹**（`server.js`、`package.json`、`package-lock.json`）。
+2. 目标电脑在该目录运行 `npm install`。
+3. 如对 `node_modules` 内的库做过手工补丁，重新 `npm install` 会覆盖，请单独备份补丁并记录库版本。
+4. 升级 whatsapp-web.js 前先备份整个文件夹。
+5. `chrome_profile\session`（登录资料）不要上传 GitHub，也不要发给他人。
+
+---
+
+## 2. 发送规则
+
+| 事件 | 群组是否收到 | 内容 |
+|---|---:|---|
+| 首次发布 | 是 | 既定文字 + 对应图片 |
+| 升级 / 降级（仍有效） | 是 | 当前新等级的文字 + 图片 |
+| Update（同等级，仅更新时间变化） | **否** | 仅内部记录 |
+| Cancel | 是 | "已取消"文字，**不附图片** |
+| 昨天已发、今天仍有效 | 是（每日一次） | 在该群组工作时间内首次成功查询后重发 |
+| 今天已发过同一事件 | 否 | — |
+| 同轮两条不同警告 | 各发一次 | 分开两次调用 |
+
+- **Cancel 的判定：** 三号变为一号或以下；黄雨取消；黄色工作暑热取消；酷热天气取消。
+- 假设：黑雨之后必为红雨，八号之后必为三号，因此属于降级而非取消。
+- 文字与图片来自 `whatsapp_service.py`，消息只显示来源时间，无 `+08:00`。
+
+**工作时间与 24/7**
+
+- 群组默认沿用全局工作时间；勾选"自定义本群工作时间"后使用自己的工作日与起止时间。
+- 所有群组都在工作时间外、且没有 24/7 群组 → 本轮**不调用任何警告 API**。
+- 有 24/7 群组 → 非工作时间仍查询，但只向 24/7 群组发送。
+- 24/7 群组今天凌晨已收到的警告，早上不重复；昨天收到的仍有效警告，在其工作时段内重发一次。
+- 时间统一为香港时间。
+
+---
+
+## 3. 目录结构
 
 ```text
-双击 BAT／运行 app.py
-  → gui.main() → QApplication → MainWindow
-  → 首页 WhatsApp Bridge 启动、二维码、登录状态
-  → AlertScheduler → AlertEngine.run_one_poll_cycle()
-  → HKO／HSWW 读取与标准化
-  → 按工作时间和群组独立订阅过滤
-  → whatsapp_service 生成文字、PNG
-  → WhatsAppBridgeClient.send_text_and_image()
-  → core.Database 记录各群组结果 → GUI 展示
+ObervatoryNotice_new/
+├─ app.py                     # 入口 + PyQt5 界面
+├─ core_new.py                # 路径、日志、设置、数据模型、SQLite
+├─ engine_new.py              # 工作时间、去重、逐群发送、调度线程
+├─ hko_data.py                # HKO/劳工处取数与标准化
+├─ whatsapp_service.py        # 文字模板 + PNG 卡片（不用其中的 Selenium 发送器）
+├─ whatsapp_bridge_client.py  # Python <-> Node Bridge 客户端
+├─ 清理旧桥接.ps1              # 清理遗留 Bridge（见第 10 节）
+├─ assets/warning_icons/      # tc3.png、hsww_amber.png、hot_weather.png 等
+├─ whatsapp_bridge/           # server.js、package.json、node_modules
+└─ .venv/
 ```
 
-## 2. 目录与启动
+**未使用的文件（可移走）：** `notification_content.py`（无人导入，且仍 `import core`）、`whatsapp_integration.py`（同样 `import core`）、旧的 `core.py` / `engine.py` / `gui.py`（Tkinter 旧版，不能与 `*_new.py` 混用）。
 
-项目根目录至少包含下列文件；请核对 `app.py` 实际导入的 GUI 文件名和 GUI 导入的引擎文件名：
+---
+
+## 4. 安装
+
+- Windows 10/11、Python 3.11+、Node.js 18+（新终端 `node -v` 可用）。Bridge 使用 Puppeteer 自带的 Chrome，不需要另装 Chrome。
+- Python 依赖（`whatsapp_service.py` 顶部仍导入 selenium，所以需要安装）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install PyQt5 requests Pillow selenium
+cd whatsapp_bridge; npm install; cd ..
+```
+
+- 图标放入 `assets/warning_icons/`，文件名以 `WARNING_CARD_STYLE` 为准。缺图不会报错，只生成没有图标的卡片（日志有 `找不到警告图标`）。
+- 启动（**只用一种方式**：PyCharm、BAT、快捷方式、自启动四选一）：
+
+```powershell
+.\.venv\Scripts\python.exe app.py
+.\.venv\Scripts\python.exe app.py --minimized
+```
+
+---
+
+## 5. 使用方法
+
+### 5.1 首次配置
+
+1. 保持**演示模式**，启动 App。
+2. **群组**页：新增群组，填 WhatsApp **精确群名**，勾选具体等级。
+3. **设置**页：工作日、起止时间、查询间隔、每轮尝试上限。
+4. 用**专用测试群组**验证文字、图片、时间。
+5. 关闭演示模式 → 保存 → **重启 App** → 在监控首页登录 WhatsApp。
+
+### 5.2 页面
+
+| 页面 | 内容 |
+|---|---|
+| 监控 | 状态、运行时间、上次查询；开始 / 立即检查 / 暂停 / 最小化 / 退出；**WhatsApp 登录与二维码**；最近结果 |
+| 群组 | 读取群组；新增 / 编辑 / 删除；逐等级订阅；24/7；自定义工作时间 |
+| 记录 | 投递记录（时间、群组、等级、结果、照片、故障代码）；打开日志目录 |
+| 设置 | 全局工作时间、查询间隔、重试上限、演示模式、自动监控、Windows 自启动 |
+
+### 5.3 切换 WhatsApp 账号
+
+**必须先在 WhatsApp 里退出旧账号，再登录新账号。**
+
+1. App 首页点"暂停"。
+2. 在手机 WhatsApp 中：**设置 → 已关联设备 → 选中本工具的设备 → 退出登录（删除设备）**。
+3. 回到 App，点击"启动／扫码登录"，**等待二维码刷新**（可能需要几十秒），用**新账号**扫码。
+4. 若长时间没有出现二维码，或状态一直是 `DISCONNECTED`：
+   - `server.js` 收到断线后只把状态设为 `DISCONNECTED`，**不会自己重新初始化**；
+   - 请从 App 或托盘选择"退出程序"，用 9.4 ① 确认端口全部关闭，再重新打开 App 点登录。
+5. 登录成功后：**重新读取群组，并逐个核对订阅**。旧账号的群名不会自动对应新账号。
+6. 先用测试群组做一次真实发送，再恢复正式监控。
+
+补充：
+- 只关闭窗口或二维码不等于退出登录。
+- 若仍无二维码，先用 9.4 ② 查看 `status/detail`，必要时运行第 10 节的清理脚本。
+- 最后手段：退出 App 后把 `chrome_profile\session` **改名备份**（不要直接删除），重启后会重新要求扫码。
+- 今天已发送的记录与本地群组编号绑定，切换账号后若复用同一个群组条目，今天已发的警告可能被去重而不再发送；测试请用新的测试群组或模拟事件。
+
+### 5.4 最小化与自启动
+
+- 关闭窗口 → 隐藏到系统托盘继续运行；**真正退出**用托盘菜单或首页"退出程序"（此时 App 会请求 Bridge `/shutdown`）。
+- 自启动在 Startup 文件夹写入 `WeatherAlert.cmd`，是**用户登录后**才启动，不是 Windows 服务。
+- 电脑睡眠期间不会轮询。长期运行请设置：屏幕可关，睡眠"从不"。
+
+---
+
+## 6. 调用流程
+
+**启动**
 
 ```text
-ObervatoryNotice/
-├─ app.py                         # 唯一程序入口 ，app.py 实际导入的 PyQt5 GUI 文件
-├─ engine.py                      # 与 core.py 配套的新引擎
-├─ core.py                        # 配置、模型、数据库
-├─ hko_data.py
-├─ whatsapp_service.py
-├─ whatsapp_bridge_client.py
-├─ whatsapp_bridge/               # 必须保留完整文件夹
-│  ├─ server.js
-│  ├─ package.json
-│  └─ node_modules/               # 在该目录运行 npm install 后产生
-├─ assets/
-│  └─ warning_icons/
-│     └─ hot_weather.png          # 酷热天气图标
-├─ .venv/
-└─ 启动天气警告通知工具.bat
+python app.py -> main() -> QApplication -> MainWindow.__init__
+   setup_logging -> SettingsManager -> Database -> WhatsAppBridgeClient
+   -> AlertEngine -> AlertScheduler -> build() -> 托盘 / QTimer
+   自动监控：演示模式直接 scheduler.start()；正式模式先 start_whatsapp()，登录后再 start
 ```
 
-**重要：必须连同整个 `whatsapp_bridge` 文件夹下载或复制。** 只有 `whatsapp_bridge_client.py` 而没有服务端 `server.js`、`package.json` 和已安装的 Node 依赖，不能启动发送服务。源码分发时不一定要复制庞大的 `node_modules`，但目标电脑必须在桥接目录执行 `npm install`。若有服务端所需的其他资源文件，也须一并保留。
+**单轮查询**
 
-Windows 上先安装 Python 项目依赖（至少 PyQt5、requests、Pillow；当前 `whatsapp_service.py` 在导入时也要求 selenium），安装 Node.js，在 `whatsapp_bridge` 目录运行 `npm install`。程序入口固定为 `app.py`；不要同时保留旧 Tkinter 入口并从 BAT 启动它。
-
-### BAT 用法
-
-提供的 BAT 放在与 `app.py` 同一目录：
-
-- 双击：用 `.venv` 中的 `pythonw.exe` 打开 **可见主窗口**，不保留黑色控制台。
-- 在命令提示符运行 `启动天气警告通知工具.bat --minimized`：启动并最小化，适合已有登录会话；首次扫码建议不要最小化。
-- 在命令提示符运行 `启动天气警告通知工具.bat --debug`：以前台控制台运行，退出后显示错误，便于排查。
-
-BAT 会检查入口、虚拟环境、Bridge 文件夹及 `node_modules`；这些检查不等于 WhatsApp 已登录或发送成功。启动后以首页状态、日志和测试群组结果为准。`app.py` 自身的登录后自启动设置是另一项功能，只在 Windows 用户**登录后**触发，不是无人登录也运行的系统服务。
-
-## 3. GUI 页面内容
-
-### 监控首页
-
-- 标题、监控状态、当前工作／非工作时间、**本次启动的运行时间**、上次查询时间。
-- 开始监控、立即检查、暂停／继续、最小化运行、退出程序。
-- 同页 WhatsApp 状态、启动／扫码登录、检查登录；未登录时**在首页**展示二维码，扫码成功后自动隐藏二维码。隐藏二维码不关闭 Bridge。
-- 最近检查及逐群发送结果；每轮结束追加 `本轮查询完成：YYYY-MM-DD HH:MM:SS`，不显示 `+08:00`。
-
-“本次运行”指从打开 App 起经过的时间，即使非工作时间不查询也继续计时；它不等于真正执行 API 查询的累计时长。若要跨重启累积，需另外持久化，不能用这个计时器代替。
-
-### 群组
-
-读取已登录账户中的群组，新增／编辑／删除订阅。每个群组可独立勾选：三号、八号四个方向、九号、十号；黄／红／黑雨；劳工处黄／红／黑工作暑热；酷热天气。每群默认**非 24/7**；填写精确群组名称，避免只用相似的显示名。
-
-### 记录
-
-查看查询时间、群组、警告级别、投递状态、图片结果和故障代码；打开日志目录。图片生成失败、文字已发但图片失败、结果未知应分开记录，不可一律显示“发送成功”。
-
-### 设置
-
-选择工作日、开始／结束时间、轮询间隔、每轮尝试上限、演示模式、启动程序自动监控、Windows 登录后自启动。演示模式更改后按界面提示重启，避免 GUI 设置和已有桥接进程的 `dry_run` 状态不一致。字体以 Qt 高 DPI 与窗口宽度自适应。
-
-## 4. 工作时间与通知规则
-
-1. 先判断是否有启用且已订阅警告的群组。
-2. 在工作时间内查询这些群组需要的数据源；非工作时间仅为明确设为 24/7 的群组查询其订阅所需来源，没有这类群组便不查询 API。
-3. HKO、劳工处数据分别读取，某个来源临时失败不应抹掉另一来源的有效数据。
-4. 一条警告按其**具体等级**匹配群组；两条警告分别构建、发送、记录。
-5. 文字取 `build_warning_message(event)`，图片取 `generate_alert_card(event)`；图片文件生成失败时应记录故障，而不是悄悄只发文字。
-6. 根据 Bridge 返回的实际状态更新每群投递；已确认成功的不再重复发送，失败／照片失败／发送结果不明需区别对待。POST 超时可能发生在实际发送之后，“结果不明”不应自动重发整个消息。
-7. 仅在完成一轮检查时写 GUI 完成时间；来源警告的发布时间与 App 查询时间分开记录。**内部 SQLite 时间保留原始值；`+08:00` 只在界面显示时去掉。**
-
-图片图标从 `assets/warning_icons/` 按等级载入。酷热天气图标文件使用 `hot_weather.png`，并在 `whatsapp_service.WARNING_CARD_STYLE['HOT_WEATHER']` 对应；请确认你本机已添加该映射。某等级无图标时卡片生成器可能仍产出 PNG，建议卡片始终印上 `event.display_name()`，以便确认图片与警告等级匹配。
-
-## 5. 更换 WhatsApp 账号
-
-**先在 WhatsApp 退出旧账号的关联设备登录，再切换账号。** 不要只关闭 GUI 中的二维码或 Chromium 窗口；那不是退出登录。建议顺序：
-
-1. 暂停监控，避免账号切换期间向错误群组发送。
-2. 在旧账号的 WhatsApp 手机端“已关联设备／Linked Devices”中退出本工具使用的网页会话；确认旧会话已注销。
-3. 从 App 的“退出程序”或托盘“退出程序”正常退出，让 Bridge 关闭；不要直接杀掉 Python／Node 进程。
-4. 重新打开 App，在首页使用新账号扫码，等登录状态确认成功。
-5. **重新读取群组并逐一核对订阅。** 数据库里旧账号的精确群组名称不会因为换号自动变成新账号群组；同名群组也应先核实目标，再恢复正式监控。
-6. 先在测试群组做一次经确认的测试，再恢复正式发送。
-
-若 Bridge 仍复用旧会话，应先停止 App 与 Bridge、备份会话数据，再按 `server.js` 的实际会话存储位置处理；在未确认服务端实现前**不要删除整个 AppData、SQLite 或项目文件夹**。当前 Python 客户端把 `chrome_profile_dir` 当作 Bridge 的 `SESSION_PATH`，但服务端如何保存子目录须查看实际 `server.js`。
-
-## 6. 函数和调用关系
-
-以下“新版 GUI／引擎／core”列出本次重构设计使用的方法名；如果你的本机版本改过名或删改方法，**以实际运行源码为准**。HKO、Service、Bridge 函数表对应上传源码。`__init__` 是创建对象时调用；以下私有 `_` 方法通常不从外部手动调用。
-
-### 6.1 入口 `app.py`
-
-| `def` | 调用与作用 |
-|---|---|
-| `main()` | 启动入口；调用 `gui.main()`，进入 Qt 事件循环；不创建 Tkinter 窗口或重复初始化托盘。 |
-
-### 6.2 PyQt5 GUI（新版）模块与弹窗
-
-| `def` | 谁调用 → 做什么／调用什么 |
-|---|---|
-| `theme(scale)` | `MainWindow.resizeEvent()` → 按窗口宽度生成统一的字体及控件样式。 |
-| `app_icon()` | `MainWindow.__init__()`、`setup_tray()` → 生成窗口及托盘图标。 |
-| `startup_file()` | 设置页、`configure_startup()` → 确定当前用户的 Windows 登录启动文件。 |
-| `configure_startup(enabled)` | `save_settings()` → 添加／删除登录启动项，目标为同一个 `app.py`。 |
-| `form_row(title, control)` | `GroupEditor.__init__()`、`MainWindow.build()` → 放置统一的表单行。 |
-| `GroupEditor.__init__()` | `edit_group_dialog()` → 构造群组名称、24/7、逐等级勾选弹窗。 |
-| `GroupEditor.save()` | 弹窗保存按钮 → 校验群组名称及警告，写回 `GroupConfig`；外层负责数据库保存。 |
-| `MainWindow.__init__()` | `gui.main()` → 建配置／DB／Bridge／引擎／调度器，装配 GUI、托盘和计时器。 |
-| `MainWindow.build()` | `__init__()` → 创建监控、群组、记录、设置四个页面；WhatsApp 二维码在监控页。 |
-| `MainWindow.resizeEvent(event)` | Qt 窗口尺寸变化 → 调用 `theme()` 调整字体与布局样式。 |
-| `MainWindow.setup_tray()` | `__init__()` → 建立显示、立即检查、退出的托盘菜单。 |
-| `MainWindow.restore_window()` | 托盘显示动作 → 恢复并聚焦主窗口。 |
-| `MainWindow.minimize_to_tray()` | 最小化按钮或 `closeEvent()` → 隐藏到托盘；无托盘则最小化到任务栏。 |
-| `MainWindow.closeEvent(event)` | Qt 关闭窗口事件 → 默认不退出，改为最小化；真正退出交给 `exit_app()`。 |
-| `MainWindow.exit_app()` | 退出按钮／托盘退出 → 停止调度、关闭 Bridge，再退出 Qt；进行中的发送不得被强制中断。 |
-| `MainWindow.run_worker(kind, operation)` | 登录、读取群组等耗时动作 → 后台线程执行，通过 `WorkerSignals.completed` 回主线程。 |
-| `MainWindow.start_whatsapp()` | 首页登录按钮或自动监控准备 → `sender.start_browser()`，然后开始查询登录及二维码。 |
-| `MainWindow.poll_auth()` | 首页检查登录／二维码定时器 → `sender.is_logged_in()`；未登录时请求 `get_login_qr_data_url()`。 |
-| `MainWindow.on_worker_complete(kind, result)` | 后台任务完成信号 → 更新 Bridge 状态、显示 QR、关闭 QR、填入群组名称。 |
-| `MainWindow.hide_qr()` | 首页隐藏二维码按钮 → 仅隐藏二维码，**不调用** `sender.quit()`。 |
-| `MainWindow.start_monitor()` | 开始按钮 → 确认正式模式已登录，再调用 `scheduler.start()`。 |
-| `MainWindow.check_now()` | 首页／托盘立即检查 → 调用 `scheduler.trigger_immediate_check()`。 |
-| `MainWindow.toggle_monitor()` | 暂停／继续按钮 → 调用 `scheduler.pause()` 或 `resume()`。 |
-| `MainWindow.update_runtime()` | 每秒 GUI 定时器 → 更新本次运行时长、当前工作时间标识。 |
-| `MainWindow.drain_events()` | GUI 队列定时器 → 接收进度／错误／完成结果，刷新记录，在每轮末尾显示完成时间。 |
-| `MainWindow.refresh_groups()` | 启动、编辑、删除后 → 从 DB 读取群组并刷新表格。 |
-| `MainWindow.selected_group()` | 编辑／删除动作 → 取得当前表格选中的 `GroupConfig`。 |
-| `MainWindow.edit_group_dialog(group)` | 新增／编辑动作 → 弹出 `GroupEditor`；确认后调用 `db.save_group()`。 |
-| `MainWindow.add_group()` | 新增按钮 → `edit_group_dialog(None)`。 |
-| `MainWindow.edit_group()` | 编辑按钮 → `selected_group()` → `edit_group_dialog(group)`。 |
-| `MainWindow.delete_group()` | 删除按钮 → 确认后 `db.delete_group()`、`refresh_groups()`。 |
-| `MainWindow.load_groups()` | 群组页读取按钮 → 后台调用 `sender.list_groups('')`；演示模式列表可能是模拟值。 |
-| `MainWindow.refresh_history()` | 启动、查询完成、刷新按钮 → `db.recent_deliveries()` 更新投递表。 |
-| `MainWindow.save_settings()` | 设置保存按钮 → 校验时间／模式、`SettingsManager.update()`、`configure_startup()`；改演示模式时提示重启。 |
-| `main()` | `app.py` → 设置 Qt DPI／字体，创建 `QApplication`、`MainWindow`，运行事件循环。 |
-
-`WorkerSignals.completed` 是 Qt 信号而非 `def`；`QTimer` 的定时回调仍在 GUI 主线程执行，因此网络查询、Node 启动不能直接在回调中长时间阻塞。
-
-### 6.3 告警引擎与调度（新版设计）
-
-| `def` | 谁调用 → 做什么／调用什么 |
-|---|---|
-| `now()` | 引擎、调度 → 产生内部香港时间戳；GUI 显示时另行格式化。 |
-| `worktime(settings)` | 引擎、GUI → 判断工作日与工作时段。 |
-| `issue_key(w)` | 引擎 → 生成警告去重键，配合逐群投递记录。 |
-| `interpret_result(result, photo_requested)` | 发送循环 → 把 Bridge 回传分类为已发、文字已发照片失败、失败或未知；不能凭未确认结果宣称照片成功。 |
-| `AlertEngine.__init__()` | GUI → 注入 DB、配置管理器、Bridge 实例。 |
-| `AlertEngine.run_one_poll_cycle()` | 调度器 → 获取单轮锁，调用 `_cycle()`，防止重叠轮询。 |
-| `AlertEngine._cycle()` | 单轮入口 → 选目标群组／数据源、读取和标准化、生成通知、逐群发送和落库。 |
-| `AlertScheduler.__init__()` | GUI → 保存引擎、配置及事件队列。 |
-| `AlertScheduler._emit()` | 调度器内部 → 将开始、进度、完成及错误放入 GUI 队列。 |
-| `AlertScheduler.start()` | GUI 登录后／开始按钮 → 启动或唤醒唯一调度线程。 |
-| `AlertScheduler.pause()` | GUI → 暂停后续定时检查。 |
-| `AlertScheduler.resume()` | GUI → 恢复检查。 |
-| `AlertScheduler.trigger_immediate_check()` | GUI／托盘 → 要求调度线程执行手动检查。 |
-| `AlertScheduler.stop()` | GUI 真正退出 → 停止线程并等待当前操作收尾。 |
-| `AlertScheduler._run()` | 后台线程 → 定期调用 `engine.run_one_poll_cycle()` 并发事件。 |
-
-若你本机引擎仍定义 `text_for(w)`，它是早期自定义通知文案；按现行要求应改由 `whatsapp_service.build_warning_message(w)` 生成，并继续用 `generate_alert_card(w, ...)` 创建照片。若本机引擎还是附件中的 `dispatch_event()`、`diff_state()`／重试游标版本，此表**不适用**，须先统一版本。
-
-### 6.4 配置、模型与仓储（配套新版 `core.py`）
-
-| `def` | 谁调用 → 做什么／调用什么 |
-|---|---|
-| `get_app_data_dir()`、`get_config_dir()`、`get_data_dir()`、`get_logs_dir()` | GUI、配置、DB、日志 → 创建／返回数据路径。 |
-| `get_snapshots_dir()`、`get_generated_images_dir()`、`get_chrome_profile_dir()` | HKO 快照、图片生成、Bridge 会话 → 返回对应目录。 |
-| `get_db_path()`、`get_config_file_path()` | `Database`、`SettingsManager` → 确定 SQLite／JSON 位置。 |
-| `setup_logging()`、`get_logger(name)` | 入口／各模块 → 初始化并取得日志对象。 |
-| `level_display_name(category, level)` | 模型、消息／卡片 → 将等级码变为可读名称。 |
-| `NormalizedWarning.rank()`、`is_active()`、`display_name()` | 引擎、GUI／图片 → 比较等级、筛掉取消状态、显示名称。 |
-| `SettingsManager.__init__()`、`save()`、`update()` | GUI → 加载和保存设置；`update()` 在保存按钮使用。 |
-| `Database.__init__()`、`conn()` | GUI／仓储 → 初始化 SQLite 与事务连接。 |
-| `Database.list_groups()`、`save_group()`、`delete_group()` | 群组页／引擎 → 查询、保存、删除订阅。 |
-| `Database.get_observed()`、`save_observed()` | 引擎 → 持久化来源观测等级与时间，供下一轮比较。 |
-| `Database.get_delivery()`、`save_delivery()` | 引擎 → 按警告／群组查询及记录发送结果、图片结果和故障。 |
-| `Database.recent_deliveries()` | 记录页 → 读取最近逐群投递记录。 |
-
-这里列的是重构版契约。最初上传的旧 `core.py` 使用 `warning_state`／`alert_events` 等旧方法，**不能与这里的 `Database.get_observed()`／`recent_deliveries()` 混用**。数据库迁移前先关闭程序并备份整个本地数据目录。
-
-### 6.5 `hko_data.py`（上传文件）
-
-| `def` | 谁调用 → 做什么／调用什么 |
-|---|---|
-| `HKODataSource.fetch_warnsum()` | 数据源抽象接口 → 子类必须实现。 |
-| `HKOOpenDataAPISource.fetch_warnsum()` | `HKOClient.fetch_warnsum_snapshot()` → 请求官方 warnsum JSON。 |
-| `fetch_hsww_warning()` | 引擎／`HKOClient.fetch_hsww_snapshot()` → 请求工作暑热 JSON。 |
-| `McpHkoDataSource.is_environment_available()` | 客户端选源 → 检查 Node／npx；不表示 MCP 已接入。 |
-| `McpHkoDataSource.fetch_warnsum()` | 实验性预留 → 当前未实现实际 MCP 数据读取。 |
-| `WarnsumSnapshot.__init__()` | `HKOClient.fetch_warnsum_snapshot()` → 包装原始数据、时间、hash、快照路径。 |
-| `HKOClient.__init__()`、`_resolve_source()` | 引擎／客户端 → 选择官方 API 或回退。 |
-| `HKOClient.fetch_hsww_snapshot()` | 调用 `fetch_hsww_warning()` 返回劳工处资料。 |
-| `HKOClient.fetch_warnsum_snapshot()` | 引擎 → 获取 warnsum、保存原始 JSON 快照并返回对象。 |
-| `normalize_warnsum()` | 引擎 → 将风球、暴雨、酷热标准化为 `NormalizedWarning`。 |
-| `normalize_hsww()` | 引擎 → 将工作暑热等级及来源时间标准化。 |
-| `diff_state()` | **旧引擎** → 比较上一轮与当前等级，决定发出／升级／降级／取消。 |
-| `now_hkt()`、`_parse_hhmm()`、`is_within_work_hours()` | **旧工作时间模块** → 计算香港当前工作时间。 |
-| `is_high_priority()`、`should_dispatch_to_group()`、`should_resend_on_work_start()` | **旧发送规则** → 含高等级非工作时间例外；新版不得直接沿用该例外。 |
-| `group_subscribes_event()` | **旧订阅规则** → 按类别匹配；新版应使用逐等级勾选。 |
-| `_fmt_time()` | `whatsapp_service` → 来源时间用于消息和卡片显示，去除 ISO 格式的 `+08:00` 后缀。 |
-| `is_urgent()`、`build_single_message()`、`build_merged_message()` | 旧消息路径；新版正式通知应统一调用 `whatsapp_service.build_warning_message()`，不合并多条。 |
-
-### 6.6 `whatsapp_service.py`（上传文件）
-
-| `def` | 谁调用 → 做什么／调用什么 |
-|---|---|
-| `_load_font()` | `generate_alert_card()` → 读取中文字体；无适用字体时可能出现缺字。 |
-| `get_warning_card_style()` | 卡片／图标 → 依据 `warning_level` 取得配色与图标文件名。 |
-| `load_warning_icon()` | `paste_warning_icon()` → 从 `assets/warning_icons/` 载入对应 PNG。 |
-| `paste_warning_icon()` | `generate_alert_card()` → 在卡片上绘制图标；缺图时返回 False。 |
-| `_warning_content()` | `build_warning_message()` → 返回繁体中文等级说明与现场安全提示。 |
-| `build_warning_message()` | **新版引擎** → 生成将实际发送的既定文字。 |
-| `generate_alert_card()` | **新版引擎** → 生成与同一事件对应的本地 PNG 路径。 |
-| `WhatsAppSender.__init__()`、`start_browser()`、`is_logged_in()`、`is_browser_alive()` | **旧 Selenium 发送器**；本方案不调用它们。 |
-| `WhatsAppSender._find_and_open_group()`、`verify_group_exists()`、`list_groups()`、`search_groups()` | **旧 Selenium 路径**；本方案用 Bridge 客户端查群。 |
-| `WhatsAppSender.send_text_and_image()`、`_send_text()`、`_send_image()`、`quit()` | **旧 Selenium 发送／退出路径**；实际发送只调用 Bridge 同名方法。 |
-
-Hot weather：`WARNING_CARD_STYLE['HOT_WEATHER']` 对应 `hot_weather.png`；`generate_alert_card()` 绘出机构、状态、来源时间及图标。若确实已加等级文字，请检查它不会与图片区、时间重叠。`build_warning_message()` 与图片使用同一 `event`，确保两者等级及来源一致。
-
-### 6.7 `whatsapp_bridge_client.py`（上传文件，保持不改）
-
-| `def` | 谁调用 → 做什么／调用什么 |
-|---|---|
-| `_find_node_executable()` | `build_node_popen_args()` → 寻找 Node 可执行文件。 |
-| `build_node_popen_args()` | `start_browser()` → 组装启动 Node Bridge 的命令。 |
-| `_find_free_port()` | `start_browser()` → 为本地 Bridge 选择端口。 |
-| `WhatsAppBridgeClient.__init__()` | GUI → 指定会话目录、headless 与演示模式。 |
-| `start_browser()` | 首页登录 → 启动 Node Bridge；首次登录可由 GUI 展示 QR。 |
-| `_wait_for_bridge_ready()` | `start_browser()` → 等待本地 `/status` 可用。 |
-| `is_logged_in()` | 首页／发送前 → 通过 Bridge `/status` 判断是否 READY。 |
-| `is_browser_alive()` | GUI／发送前 → 判断 Bridge 子进程是否仍存活。 |
-| `get_login_qr_data_url()` | 首页二维码 → 获取 `/qr` 的 data URL；仅在 GUI 中显示，不代表登录成功。 |
-| `search_groups()`、`list_groups()` | 群组页 → 请求 Bridge 群组列表，返回名称与 ID；演示模式是模拟数据。 |
-| `verify_group_exists()` | 可选群组测试 → 用精确名称检查群组。 |
-| `send_text_and_image()` | **引擎唯一实际发送入口** → POST `/send`，传群组精确名称、文字和图片路径。 |
-| `quit()` | 真正退出 App → 请求关闭并终止本程序启动的 Bridge 进程。 |
-
-`get_login_qr_data_url()` 只负责读取二维码，隐藏二维码不等于退出 WhatsApp。Bridge 客户端将服务端 `/send` 的 JSON 原样返回；因未收到 `server.js`，不能保证其包含独立的“图片成功”字段或标准故障代码。不要把 `SENT` 擅自解释为照片确认成功。
-
-## 7. 测试与常见故障
-
-- **GUI 可打开但不自动发送：** 检查是否演示模式、是否已登录、群组是否启用与勾选，以及工作时间／24/7 状态。
-- **只有旧版方法或缺少 `RANKS`：** 代码混版；核对 `app.py → GUI → engine → core` 的实际导入，先备份再统一文件。
-- **有文字没照片：** 看图片是否生成，检查 `/send` 回传、群组实际消息；不要重新发送整条造成文字重复。
-- **不见酷热图标：** 核对等级码 `HOT_WEATHER`、`WARNING_CARD_STYLE` 映射、`assets/warning_icons/hot_weather.png` 的文件名与大小写。
-- **切号后仍连旧号：** 先在旧账号手机端退出关联设备，再退出 App，核对 Bridge 会话缓存后重新扫码；重新确认群组订阅。
-- **黑窗／程序意外退出：** 用 BAT `--debug` 启动，并查看 `%LOCALAPPDATA%\HKO_WhatsApp_Alert\logs\app.log`。
-- **电脑睡眠：** 即使最小化或设了 Windows 登录自启，设备睡眠期间也不能按时轮询；关屏与睡眠是不同设置。
-
-在试发前保持演示模式，使用**专用测试群组**确认文字、图片、时间格式、逐群记录、托盘与账号切换。保存旧版数据库备份；不要将 WhatsApp 会话、SQLite 数据库、日志、图标版权不明素材或 `node_modules` 直接上传公开仓库。
-
-## 8. 核对本机所有 `def`
-
-你的本机最新版尚未上传。要列出**实际正在运行的**各模块函数名称，可在项目根目录临时运行以下命令（仅做静态解析，不会发送消息）：
-
-```bat
-.venv\Scripts\python.exe -c "import ast,pathlib; files=('app.py','gui.py','engine.py','core.py','hko_data.py','whatsapp_service.py','whatsapp_bridge_client.py'); [(print('\n'+f),[print((n.name+'.'+m.name) if isinstance(n,ast.ClassDef) else n.name) for n in ast.parse(pathlib.Path(f).read_text(encoding='utf-8')).body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) for m in (n.body if isinstance(n,ast.ClassDef) else [n]) if isinstance(m,ast.FunctionDef)]) for f in files]"
+```text
+AlertScheduler._run -> AlertEngine.run_one_poll_cycle（非阻塞锁）-> _cycle
+  过滤群组 -> eligible = 在工作时间内 或 24/7
+  eligible 为空 -> 不调用 API
+  HKOClient.fetch_warnsum_snapshot -> normalize_warnsum
+  fetch_hsww_warning               -> normalize_hsww
+  逐条警告：
+    已取消 -> _cancel：只发文字
+    有效   -> ISSUE / UPGRADE / DOWNGRADE 发送；UPDATE 不发送
 ```
 
-如果实际 GUI／引擎文件名不同，请在命令中的 `files` 修改。此命令只列顶层函数及类方法，**不会替你证明哪个函数真的被调用**；要做到与运行版完全一致的逐函数调用图，需要依据本机最新版源码进行审计。
+**发送**
+
+```text
+build_warning_message(event) -> 文字
+generate_alert_card(event)   -> PNG（Cancel 不生成）
+WhatsAppBridgeClient.send_text_and_image(群名, 文字, 图片或 None)
+   -> 检查 /status -> POST /send -> server.js 按精确群名定位并发送
+interpret_result -> db.save_delivery
+```
+
+后台线程通过 `queue` / `pyqtSignal` 回主线程，由 `QTimer -> drain_events()` 刷新界面。
+
+---
+
+## 7. `.py` 互相调用
+
+```text
+app.py                 -> core_new, engine_new, whatsapp_bridge_client
+engine_new.py          -> core_new, hko_data, whatsapp_service
+whatsapp_service.py    -> core_new, hko_data（_fmt_time 等）
+hko_data.py            -> core_new
+whatsapp_bridge_client -> core_new
+        └─(HTTP)-> whatsapp_bridge/server.js -> Puppeteer/Chrome -> WhatsApp Web
+未被调用：notification_content.py、whatsapp_integration.py
+```
+
+不要让 `hko_data` 反向导入 `whatsapp_service`（会形成循环依赖）。
+
+---
+
+## 8. `def` 速查
+
+**`core_new.py`**
+
+| 名称 | 作用 |
+|---|---|
+| `get_*_dir()` / `get_db_path()` / `get_config_file_path()` | 返回 `%LOCALAPPDATA%\HKO_WhatsApp_Alert\...` 并自动建目录 |
+| `setup_logging()` / `get_logger()` | 每日轮转的 `app.log` |
+| `NormalizedWarning.rank / is_active / display_name` | 等级高低、是否有效、名称 |
+| `SettingsManager.save / update` | 读写 `settings.json` |
+| `Database.list_groups / save_group / delete_group` | 群组与订阅、工作时间 |
+| `get_observed / save_observed` | 每类警告上次观测等级（判断发布/升降级/取消） |
+| `get_delivery / save_delivery / last_text_send` | 逐群投递记录；日内去重与跨日重发 |
+| `recent_deliveries` | 记录页 |
+
+**`engine_new.py`**
+
+| 名称 | 作用 |
+|---|---|
+| `worktime` / `group_worktime` | 全局 / 群组工作时间 |
+| `issue_key` / `transition_key` / `cancellation_key` | 发布、升降级、取消各自独立的去重键 |
+| `interpret_result` | 把 Bridge 回传归类为 SENT / FAILED / UNKNOWN 及照片状态 |
+| `AlertEngine._cycle / _cancel / _send_to_groups / _record_content_failure` | 单轮流程、取消、逐群发送与重试、内容生成失败记录 |
+| `AlertScheduler.start / pause / resume / stop / trigger_immediate_check / _run` | 单一轮询线程 |
+
+**`hko_data.py`**
+
+| 名称 | 作用 |
+|---|---|
+| `fetch_hsww_warning` / `HKOClient.fetch_warnsum_snapshot` | 取数（HKO 快照存入 `snapshots/`） |
+| `normalize_warnsum` / `normalize_hsww` | 标准化为 `NormalizedWarning`；劳工处有效资料在 `raw["hsww"]` |
+| `_fmt_time` | 显示为 `YYYY-MM-DD HH:MM`（仅显示用，不改原始数据） |
+| `diff_state`、`should_dispatch_to_group`、`build_*_message`、`McpHkoDataSource` | 旧流程遗留，新引擎不使用 |
+
+**`whatsapp_service.py`**
+
+| 名称 | 作用 |
+|---|---|
+| `WARNING_MESSAGE_FORMATS` | 每个等级 `(标题, 等级名, 状态, 指示语, 来源)`，**必须是完整 5 元组** |
+| `WARNING_CARD_STYLE` | 每个等级的图标、颜色、来源 |
+| `build_warning_message` / `generate_alert_card` | 文字 / PNG（保存到 `data/generated_images/`） |
+| `WhatsAppSender.*` | 旧 Selenium 发送器，不使用 |
+
+**`whatsapp_bridge_client.py`**
+
+| 名称 | 作用 |
+|---|---|
+| `start_browser` | 启动或复用 Node Bridge；`ERROR` 直接抛错 |
+| `is_logged_in` / `is_browser_alive` | `/status == READY` / 进程存活 |
+| `get_login_qr_data_url` | `/qr` -> 二维码，供首页显示 |
+| `list_groups` / `search_groups` / `verify_group_exists` | 群组列表与校验 |
+| `send_text_and_image` | 引擎唯一发送入口，POST `/send` |
+| `quit` | POST `/shutdown` 并终止自己启动的进程 |
+
+**`app.py`**
+
+| 名称 | 作用 |
+|---|---|
+| `theme` / `resizeEvent` | 字体随窗口宽度调整 |
+| `setup_tray` / `minimize_to_tray` / `closeEvent` / `exit_app` | 托盘与退出 |
+| `configure_startup` | Windows 登录自启动 |
+| `GroupEditor` | 订阅、24/7、自定义工作时间 |
+| `start_whatsapp` / `poll_auth` / `on_worker_complete` / `hide_qr` | 首页登录与二维码 |
+| `start_monitor` / `check_now` / `toggle_monitor` | 控制调度器 |
+| `update_runtime` / `drain_events` | 运行时间；显示每轮完成时间 |
+| `save_settings` | 校验并保存；改演示模式需重启 |
+
+---
+
+## 9. 日志、数据与端口
+
+### 9.1 位置
+
+```text
+%LOCALAPPDATA%\HKO_WhatsApp_Alert\
+├─ logs\app.log             # 当天日志；午夜轮转为 app.log.YYYY-MM-DD
+├─ config\settings.json
+├─ data\app_state.sqlite3   # 群组、观测状态、投递记录
+├─ data\snapshots\          # HKO 原始 JSON
+├─ data\generated_images\   # 发送用 PNG
+└─ chrome_profile\session\  # WhatsApp 登录会话（勿删勿外传）
+```
+
+### 9.2 查看日志
+
+```powershell
+explorer "$env:LOCALAPPDATA\HKO_WhatsApp_Alert\logs"
+Get-Content "$env:LOCALAPPDATA\HKO_WhatsApp_Alert\logs\app.log" -Tail 80
+Get-Content "$env:LOCALAPPDATA\HKO_WhatsApp_Alert\logs\app.log" -Wait
+Select-String "$env:LOCALAPPDATA\HKO_WhatsApp_Alert\logs\app.log" -Pattern "ERROR|WARNING|Traceback|Bridge"
+```
+
+"记录"页有"打开日志目录"按钮；Node Bridge 输出以 `[Bridge]` 前缀写入同一份日志。
+
+### 9.3 列出本机所有 `def`
+
+```powershell
+.\.venv\Scripts\python.exe -c "import ast,pathlib; [print(f, [n.name for n in ast.walk(ast.parse(pathlib.Path(f).read_text(encoding='utf-8'))) if isinstance(n,(ast.FunctionDef,ast.ClassDef))]) for f in ['app.py','core_new.py','engine_new.py','hko_data.py','whatsapp_service.py','whatsapp_bridge_client.py']]"
+```
+
+### 9.4 用 PowerShell 检查 Bridge 端口是开启还是关闭
+
+Bridge 端口范围为 `8765`–`8784`（仅本机）。
+
+| 场景 | 正常结果 |
+|---|---|
+| App 已完全退出 | **没有监听端口**（等待 5–10 秒） |
+| App 运行中（正式模式） | **恰好 1 个端口**，`status` 为 `READY` 或 `QR_PENDING` |
+| 演示模式 | 不启动 Bridge，没有端口 |
+| 2 个或更多端口 | 异常，见第 10 节 |
+
+> PowerShell 的 `$PID` 是只读保留变量，循环变量请用 `$procId`。
+
+**① 端口是否开启**（无输出＝全部关闭）
+
+```powershell
+Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+  Where-Object { $_.LocalPort -ge 8765 -and $_.LocalPort -le 8784 } |
+  Select-Object LocalPort, OwningProcess
+```
+
+**② 完整诊断：端口 + 进程 + WhatsApp 状态**
+
+```powershell
+$listen = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+  Where-Object { $_.LocalPort -ge 8765 -and $_.LocalPort -le 8784 }
+if (-not $listen) {
+  Write-Host "Bridge 端口：全部关闭" -ForegroundColor Green
+} else {
+  $rows = foreach ($item in $listen) {
+    $procId = $item.OwningProcess
+    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    try {
+      $s = Invoke-RestMethod "http://127.0.0.1:$($item.LocalPort)/status" -TimeoutSec 3
+      $state = $s.status; $detail = $s.detail
+    } catch { $state = "无法读取"; $detail = $_.Exception.Message }
+    [pscustomobject]@{ Port = $item.LocalPort; ProcId = $procId
+                       Process = $proc.ProcessName; Status = $state; Detail = $detail }
+  }
+  $rows | Format-Table -AutoSize
+  if (@($rows).Count -gt 1) { Write-Host "警告：多个 Bridge 端口，可能有残留" -ForegroundColor Yellow }
+  else { Write-Host "仅 1 个（正常）" -ForegroundColor Green }
+}
+```
+
+**③ 每 5 秒刷新（Ctrl+C 结束）**
+
+```powershell
+while ($true) {
+  Clear-Host; Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  $l = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+    Where-Object { $_.LocalPort -ge 8765 -and $_.LocalPort -le 8784 }
+  if ($l) { $l | Select-Object LocalPort, OwningProcess | Format-Table -AutoSize } else { "Bridge 端口：全部关闭" }
+  Start-Sleep -Seconds 5
+}
+```
+
+**④ 手动优雅关闭某个端口**（等同 App 退出时做的事，不删除登录会话）
+
+```powershell
+Invoke-RestMethod -Method Post "http://127.0.0.1:8765/shutdown"
+```
+
+**⑤ 确认没有 Chrome 仍占用会话目录**（无输出才算干净）
+
+```powershell
+$s = "$env:LOCALAPPDATA\HKO_WhatsApp_Alert\chrome_profile\session"
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -eq 'chrome.exe' -and $_.CommandLine -match [regex]::Escape($s) } |
+  Select-Object ProcessId, ParentProcessId
+```
+
+---
+
+## 10. 清理旧的混乱桥接窗口
+
+用于清理**遗留**的 Bridge：多个 `node.exe server.js`、以及占用登录会话的 Chromium 窗口。正常关闭 App 后不需要。
+
+**先决条件：** 先从 App 或托盘"退出程序"。脚本发现 `app.py` 仍在运行时，执行模式会自动中止。
+
+**做了什么：**
+
+1. 找出监听 `8765`–`8784` 的进程、对应的 `node.exe server.js`、以及命令行含 `chrome_profile\session` 的 Chrome。
+2. 先向每个端口发 `/shutdown`（优雅关闭）。
+3. 仍残留的 Node，用 `taskkill /T /F` 结束（连同其 Chromium 子进程）。
+4. 仍占用会话的 Chrome，再结束一次。
+5. 复查端口和 Chrome。
+
+**不会做：** 不删除 `chrome_profile\session`（不会丢登录）；不碰命令行不含会话路径的 Chrome，也不碰不监听这些端口且没有会话子进程的 Node。
+
+**用法：** 保存为 `清理旧桥接.ps1`（**UTF-8 带 BOM**，Windows PowerShell 5.1 才能正确显示中文；单独提供的文件已是此编码）。
+
+```powershell
+# 1) 预览（默认，不结束任何进程）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\清理旧桥接.ps1
+
+# 2) 确认无误后执行
+powershell -NoProfile -ExecutionPolicy Bypass -File .\清理旧桥接.ps1 -Apply
+```
+
+完整代码：
+
+```powershell
+<#
+清理旧桥接.ps1
+用途：清理遗留的 WhatsApp Bridge（node.exe server.js）及其 Chromium 窗口。
+默认是"预览模式"，只显示将被处理的内容，不结束任何进程。
+加上 -Apply 才会真正执行。
+不会删除 WhatsApp 登录会话（chrome_profile\session）。
+
+用法：
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\清理旧桥接.ps1
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\清理旧桥接.ps1 -Apply
+#>
+param([switch]$Apply)
+
+$portFirst = 8765
+$portLast  = 8784
+$session   = Join-Path $env:LOCALAPPDATA 'HKO_WhatsApp_Alert\chrome_profile\session'
+$sessionRx = [regex]::Escape($session)
+
+function Get-BridgeListeners {
+    Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPort -ge $portFirst -and $_.LocalPort -le $portLast }
+}
+
+function Get-SessionChrome {
+    Get-CimInstance Win32_Process |
+        Where-Object { $_.Name -eq 'chrome.exe' -and $_.CommandLine -match $sessionRx }
+}
+
+function Get-BridgeNodes {
+    $listenPids    = @(Get-BridgeListeners | Select-Object -ExpandProperty OwningProcess -Unique)
+    $chromeParents = @(Get-SessionChrome   | Select-Object -ExpandProperty ParentProcessId -Unique)
+    Get-CimInstance Win32_Process |
+        Where-Object {
+            $_.Name -eq 'node.exe' -and $_.CommandLine -match 'server\.js' -and
+            ($listenPids -contains $_.ProcessId -or $chromeParents -contains $_.ProcessId)
+        }
+}
+
+if ($Apply) { $mode = '执行模式' } else { $mode = '预览模式（不会结束任何进程）' }
+Write-Host "=== 天气警告 Bridge 清理：$mode ===" -ForegroundColor Cyan
+
+# 0. App 是否仍在运行
+$apps = @(Get-CimInstance Win32_Process |
+    Where-Object { $_.Name -match '^pythonw?\.exe$' -and $_.CommandLine -match 'app\.py' })
+if ($apps.Count -gt 0) {
+    Write-Host "`n检测到可能仍在运行的 App：" -ForegroundColor Yellow
+    $apps | Select-Object ProcessId, CommandLine | Format-List
+    if ($Apply) {
+        Write-Host '请先从 App 或系统托盘选择退出程序，再重新运行。已停止。' -ForegroundColor Red
+        exit 1
+    }
+}
+
+Write-Host "`n[1] 监听中的 Bridge 端口（$portFirst-$portLast）"
+$listen = @(Get-BridgeListeners)
+if ($listen.Count -eq 0) { Write-Host "  无" }
+else { $listen | Select-Object LocalPort, OwningProcess | Format-Table -AutoSize }
+
+Write-Host "[2] Bridge 的 Node 进程"
+$nodes = @(Get-BridgeNodes)
+if ($nodes.Count -eq 0) { Write-Host "  无" }
+else { $nodes | Select-Object ProcessId, ParentProcessId | Format-Table -AutoSize }
+
+Write-Host "[3] 占用登录会话的 Chrome"
+$chrome = @(Get-SessionChrome)
+Write-Host "  $($chrome.Count) 个进程"
+
+if (-not $Apply) {
+    Write-Host "`n以上仅为预览。确认这些都是天气警告工具的 Bridge 后，加上 -Apply 再运行。" -ForegroundColor Yellow
+    exit 0
+}
+
+# 1/3 优雅关闭（等同 App 退出时做的事）
+Write-Host "`n[执行 1/3] 请求优雅关闭"
+foreach ($item in $listen) {
+    try {
+        Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$($item.LocalPort)/shutdown" -TimeoutSec 5 | Out-Null
+        Write-Host "  已请求关闭端口 $($item.LocalPort)"
+    } catch {
+        Write-Host "  端口 $($item.LocalPort) 未响应：$($_.Exception.Message)"
+    }
+}
+Start-Sleep -Seconds 8
+
+# 2/3 仍残留的 Node 进程（/T 会连同其 Chromium 子进程一起结束）
+Write-Host "[执行 2/3] 结束仍残留的 Bridge 进程树"
+foreach ($node in @(Get-BridgeNodes)) {
+    Write-Host "  结束 Node PID $($node.ProcessId)"
+    taskkill /PID $node.ProcessId /T /F 2>$null | Out-Null
+}
+Start-Sleep -Seconds 2
+
+# 3/3 仍占用会话的 Chrome
+Write-Host "[执行 3/3] 结束仍占用会话的 Chrome"
+foreach ($c in @(Get-SessionChrome)) {
+    taskkill /PID $c.ProcessId /T /F 2>$null | Out-Null
+}
+Start-Sleep -Seconds 2
+
+Write-Host "`n=== 结果 ===" -ForegroundColor Cyan
+$leftPorts  = @(Get-BridgeListeners)
+$leftChrome = @(Get-SessionChrome)
+if ($leftPorts.Count -eq 0 -and $leftChrome.Count -eq 0) {
+    Write-Host "已清理干净：没有 Bridge 端口，也没有 Chrome 占用会话。登录会话未被删除。" -ForegroundColor Green
+    Write-Host "现在可以只启动一份 App。"
+} else {
+    Write-Host "仍有残留，请再运行一次，或手动检查：" -ForegroundColor Yellow
+    if ($leftPorts.Count  -gt 0) { $leftPorts  | Select-Object LocalPort, OwningProcess | Format-Table -AutoSize }
+    if ($leftChrome.Count -gt 0) { Write-Host "  仍有 $($leftChrome.Count) 个 Chrome 进程占用会话目录" }
+}
+```
+
+执行后用 9.4 ① 复查：**没有输出**，再只启动一份 App。
+
+> 该脚本未在 PowerShell 环境中实际运行验证。请先用预览模式确认列出的都是你的 Bridge。如果你电脑上另有其他项目也运行 `node server.js` 并监听 `8765`–`8784`，预览时会被列出，请勿执行。
+
+---
+
+## 11. 尚需注意的问题
+
+1. **照片状态记录与 `server.js` 不一致。** `server.js` 中 `SENT`＝文字成功且（带图片时）图片也成功，`SENT_TEXT_ONLY`＝图片失败；但 `interpret_result()` 会把二者都记为 `PHOTO_UNKNOWN`。后果：成功的图片显示"未知"，失败也不显示"失败"。建议在 `explicit` 判断之前加入（只影响记录显示，不影响是否重发）：
+
+   ```python
+   if status == "SENT_TEXT_ONLY":
+       return "PHOTO_FAILED", "FAILED", code, detail
+   if status == "SENT" and photo_requested:
+       return "SENT", "SENT", code, detail
+   ```
+
+2. **`app.py` 没有 Windows 单实例锁。** 同时启动两份（PyCharm 与 BAT、自启动与手动）仍可能争用同一会话。
+3. **异常退出可能残留 Bridge。** 崩溃、被强杀、断电后，下次启动客户端会向上换端口；用 9.4 检查，用第 10 节清理。
+4. **POST 超时后的结果不明。** 超时可能发生在服务端已发送之后，被记为 `UNKNOWN` 且**不自动重发**；需人工核对群组。
+5. **HTTP 4xx 的细节丢失。** 未就绪时 `server.js` 返回 409 且带 `detail`，Python 端只显示 `Bridge HTTP 409`。
+6. **UPDATE 判定依赖来源数据。** 若 `issueTime` 变化会产生新的去重键，是否算新发布取决于 HKO / 劳工处的实际返回。
+7. **去重会让"改完没反应"。** 今天已成功发给某群组的同一事件不会再发。测试请用专用测试群组或新的模拟事件，**不要删除正式投递记录**。
+8. `/groups` 与 `/search_groups` 仍调用 `client.getChats()`，在受影响的 WhatsApp Web 版本上可能 500；Python 走 `/list_groups`，不受影响。
+9. 仅验证 Windows；`CREATE_NO_WINDOW`、Startup 文件夹、`LOCALAPPDATA` 是 Windows 特性，macOS 未验证。
+10. whatsapp-web.js 是非官方自动化库，账号可能被限制，请自行评估合规性。
+
+**日常运维：** 开工前看首页（是否已登录、是否演示模式）；出问题先看 `app.log` 末尾和"记录"页故障代码；睡眠设"从不"；定期备份 `app_state.sqlite3`、`settings.json`、`whatsapp_bridge\`；升级时 `app.py + core_new.py + engine_new.py` 三者必须同版本整套替换。
+
+---
+
+## 12. 故障代码
+
+| 代码 | 含义 | 自动重试 |
+|---|---|---|
+| `SENT` | 文字已发（带图片时图片也成功） | — |
+| `SENT_TEXT_ONLY` | 文字已发，图片失败 | 否 |
+| `PHOTO_UNKNOWN` | 文字已发，图片结果未确认 | 否 |
+| `PHOTO_FAILED` | 文字已发，图片失败 | 否（避免文字重复） |
+| `NOT_REQUESTED` | Cancel 等不带图片 | — |
+| `FAILED` | 明确未发送（未登录、群不存在、Bridge 未启动等） | 是，本轮内按上限 |
+| `UNKNOWN` | 超时或回传异常，无法确认 | **否** |
+| `CONTENT_GENERATION_FAILED` | 文字或图片生成失败（不改发纯文字） | 否 |
+| `SOURCE_FAILED` | HKO / 劳工处 API 失败 | 下一轮再查 |
+| `DRY_RUN` | 演示模式，未真实发送 | — |
