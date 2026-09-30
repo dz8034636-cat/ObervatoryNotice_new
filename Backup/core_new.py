@@ -72,7 +72,6 @@ class NormalizedWarning:
     update_time: str | None = None
     expire_time: str | None = None
     detected_time: str | None = None
-    source_message: str | None = None
     source_payload_hash: str = ''
     message_id: str = ''
     delivery_status: str = 'PENDING'
@@ -90,10 +89,6 @@ class GroupConfig:
     enabled: bool = True
     is_24x7: bool = False
     subscriptions: dict[str,bool] = field(default_factory=lambda: {k:False for k in LEVELS})
-    custom_work_hours_enabled: bool = False
-    workdays: list[int] = field(default_factory=list)
-    work_start_time: str = '09:00'
-    work_end_time: str = '18:00'
 
 @dataclass
 class AppSettings:
@@ -156,20 +151,7 @@ class Database:
                   attempted_at TEXT NOT NULL, attempts INTEGER NOT NULL,
                   UNIQUE(category,issue_key,group_id));
                 CREATE INDEX IF NOT EXISTS ix_deliveries_recent ON deliveries(id DESC);
-                CREATE TABLE IF NOT EXISTS daily_text_sends (
-                  category TEXT NOT NULL, issue_key TEXT NOT NULL, group_id INTEGER NOT NULL,
-                  send_day TEXT NOT NULL, sent_at TEXT NOT NULL, status TEXT NOT NULL,
-                  PRIMARY KEY(category,issue_key,group_id,send_day));
             ''')
-            columns = {r['name'] for r in db.execute('PRAGMA table_info(alert_groups)')}
-            for column, definition in (
-                ('custom_work_hours_enabled', 'INTEGER NOT NULL DEFAULT 0'),
-                ('workdays', "TEXT NOT NULL DEFAULT '[]'"),
-                ('work_start_time', "TEXT NOT NULL DEFAULT '09:00'"),
-                ('work_end_time', "TEXT NOT NULL DEFAULT '18:00'"),
-            ):
-                if column not in columns:
-                    db.execute(f'ALTER TABLE alert_groups ADD COLUMN {column} {definition}')
             count = db.execute('SELECT COUNT(*) FROM alert_groups').fetchone()[0]
             old = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='groups'").fetchone()
             if count == 0 and old:
@@ -185,23 +167,8 @@ class Database:
                     for flag,levels in legacy.items():
                         if flag in keys and row[flag]:
                             for level in levels: sub[level] = True
-                    db.execute('INSERT INTO alert_groups(group_id,display_name,whatsapp_exact_name,enabled,is_24x7,subscriptions) VALUES(?,?,?,?,?,?)',
+                    db.execute('INSERT INTO alert_groups VALUES(?,?,?,?,?,?)',
                                (row['group_id'],row['display_name'],row['whatsapp_exact_name'],row['enabled'],row['is_24x7'],json.dumps(sub)))
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-            hkt = ZoneInfo('Asia/Hong_Kong')
-            for old_send in db.execute("SELECT category,issue_key,group_id,attempted_at,status FROM deliveries WHERE status IN ('SENT','PHOTO_FAILED','PHOTO_UNKNOWN')").fetchall():
-                try:
-                    sent_at = datetime.fromisoformat(old_send['attempted_at'])
-                    if sent_at.tzinfo is None:
-                        sent_at = sent_at.replace(tzinfo=hkt)
-                    send_day = sent_at.astimezone(hkt).date().isoformat()
-                    db.execute('''INSERT OR IGNORE INTO daily_text_sends(category,issue_key,group_id,send_day,sent_at,status)
-                                  VALUES(?,?,?,?,?,?)''',
-                               (old_send['category'],old_send['issue_key'],old_send['group_id'],send_day,
-                                old_send['attempted_at'],old_send['status']))
-                except (TypeError, ValueError):
-                    get_logger('core').warning('旧投递时间无法迁移：group=%s issue=%s',old_send['group_id'],old_send['issue_key'])
     @contextmanager
     def conn(self):
         db = sqlite3.connect(str(self.path),timeout=20)
@@ -216,17 +183,13 @@ class Database:
     def list_groups(self):
         with self._lock,self.conn() as db:
             rows=db.execute('SELECT * FROM alert_groups ORDER BY group_id').fetchall()
-        return [GroupConfig(r['group_id'],r['display_name'],r['whatsapp_exact_name'],bool(r['enabled']),bool(r['is_24x7']),json.loads(r['subscriptions']),bool(r['custom_work_hours_enabled']),json.loads(r['workdays']),r['work_start_time'],r['work_end_time']) for r in rows]
+        return [GroupConfig(r['group_id'],r['display_name'],r['whatsapp_exact_name'],bool(r['enabled']),bool(r['is_24x7']),json.loads(r['subscriptions'])) for r in rows]
     def save_group(self,g):
         with self._lock,self.conn() as db:
-            args=(g.display_name,g.whatsapp_exact_name,int(g.enabled),int(g.is_24x7),json.dumps(g.subscriptions),
-                  int(g.custom_work_hours_enabled),json.dumps(g.workdays),g.work_start_time,g.work_end_time)
+            args=(g.display_name,g.whatsapp_exact_name,int(g.enabled),int(g.is_24x7),json.dumps(g.subscriptions))
             if g.group_id is None:
-                g.group_id=db.execute('''INSERT INTO alert_groups(display_name,whatsapp_exact_name,enabled,is_24x7,subscriptions,
-                    custom_work_hours_enabled,workdays,work_start_time,work_end_time) VALUES(?,?,?,?,?,?,?,?,?)''',args).lastrowid
-            else:
-                db.execute('''UPDATE alert_groups SET display_name=?,whatsapp_exact_name=?,enabled=?,is_24x7=?,subscriptions=?,
-                    custom_work_hours_enabled=?,workdays=?,work_start_time=?,work_end_time=? WHERE group_id=?''',args+(g.group_id,))
+                g.group_id=db.execute('INSERT INTO alert_groups(display_name,whatsapp_exact_name,enabled,is_24x7,subscriptions) VALUES(?,?,?,?,?)',args).lastrowid
+            else: db.execute('UPDATE alert_groups SET display_name=?,whatsapp_exact_name=?,enabled=?,is_24x7=?,subscriptions=? WHERE group_id=?',args+(g.group_id,))
         return g.group_id
     def delete_group(self,group_id):
         with self._lock,self.conn() as db: db.execute('DELETE FROM alert_groups WHERE group_id=?',(group_id,))
@@ -247,22 +210,6 @@ class Database:
                level=excluded.level,status=excluded.status,photo_status=excluded.photo_status,fault_code=excluded.fault_code,
                detail=excluded.detail,checked_at=excluded.checked_at,attempted_at=excluded.attempted_at,attempts=excluded.attempts''',
                (w.warning_category,w.warning_level,issue_key,group_id,status,photo_status,str(code),str(detail),checked_at,attempted_at,attempts))
-            if status in ('SENT','PHOTO_FAILED','PHOTO_UNKNOWN'):
-                from datetime import datetime
-                from zoneinfo import ZoneInfo
-                sent = datetime.fromisoformat(attempted_at)
-                hkt = ZoneInfo('Asia/Hong_Kong')
-                if sent.tzinfo is None:
-                    sent = sent.replace(tzinfo=hkt)
-                day = sent.astimezone(hkt).date().isoformat()
-                db.execute('''INSERT INTO daily_text_sends(category,issue_key,group_id,send_day,sent_at,status)
-                              VALUES(?,?,?,?,?,?) ON CONFLICT(category,issue_key,group_id,send_day) DO UPDATE SET
-                              sent_at=excluded.sent_at,status=excluded.status''',
-                           (w.warning_category,issue_key,group_id,day,attempted_at,status))
-    def last_text_send(self,category,issue_key,group_id):
-        with self._lock,self.conn() as db:
-            return db.execute('''SELECT * FROM daily_text_sends WHERE category=? AND issue_key=? AND group_id=?
-                                 ORDER BY send_day DESC LIMIT 1''',(category,issue_key,group_id)).fetchone()
     def recent_deliveries(self,limit=100):
         with self._lock,self.conn() as db:
             return db.execute('''SELECT d.*,g.display_name FROM deliveries d LEFT JOIN alert_groups g ON d.group_id=g.group_id

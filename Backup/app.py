@@ -24,7 +24,7 @@ from core_new import (
     CATEGORIES, LEVEL_NAMES, Database, GroupConfig, SettingsManager,
     get_logs_dir, setup_logging,
 )
-from engine_new import AlertEngine, AlertScheduler, worktime, group_worktime
+from engine_new import AlertEngine, AlertScheduler, worktime
 from whatsapp_bridge_client import WhatsAppBridgeClient
 
 
@@ -120,7 +120,7 @@ class GroupEditor(QDialog):
         super().__init__(parent)
         self.group = group or GroupConfig()
         self.setWindowTitle('群组与警告订阅')
-        self.resize(610, 690)
+        self.resize(610, 660)
         outer = QVBoxLayout(self)
         outer.addWidget(QLabel('请选择 WhatsApp 精确群组名称及要接收的警告。'))
         self.name = QComboBox()
@@ -134,37 +134,6 @@ class GroupEditor(QDialog):
         self.round_clock.setChecked(self.group.is_24x7)
         outer.addWidget(self.enabled)
         outer.addWidget(self.round_clock)
-        self.custom_hours = QCheckBox('自定义本群工作时间（24/7 时用于跨日提醒）')
-        self.custom_hours.setChecked(self.group.custom_work_hours_enabled)
-        outer.addWidget(self.custom_hours)
-        hours = QGroupBox('工作日与时间 · 香港时间')
-        schedule = QVBoxLayout(hours)
-        self.group_days = []
-        day_row = QHBoxLayout()
-        default_days = self.group.workdays if self.group.custom_work_hours_enabled else parent.settings.settings.workdays
-        for index, label in enumerate('一二三四五六日'):
-            box = QCheckBox(label)
-            box.setChecked(index in default_days)
-            day_row.addWidget(box)
-            self.group_days.append(box)
-        schedule.addLayout(day_row)
-        time_row = QHBoxLayout()
-        default_start = self.group.work_start_time if self.group.custom_work_hours_enabled else parent.settings.settings.work_start_time
-        default_end = self.group.work_end_time if self.group.custom_work_hours_enabled else parent.settings.settings.work_end_time
-        self.group_start = QTimeEdit()
-        self.group_start.setDisplayFormat('HH:mm')
-        self.group_start.setTime(QTime.fromString(default_start, 'HH:mm'))
-        self.group_end = QTimeEdit()
-        self.group_end.setDisplayFormat('HH:mm')
-        self.group_end.setTime(QTime.fromString(default_end, 'HH:mm'))
-        time_row.addWidget(QLabel('开始'))
-        time_row.addWidget(self.group_start)
-        time_row.addWidget(QLabel('结束'))
-        time_row.addWidget(self.group_end)
-        schedule.addLayout(time_row)
-        hours.setEnabled(self.custom_hours.isChecked())
-        self.custom_hours.toggled.connect(hours.setEnabled)
-        outer.addWidget(hours)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         body = QWidget()
@@ -201,18 +170,7 @@ class GroupEditor(QDialog):
         self.group.whatsapp_exact_name = name
         self.group.display_name = name
         self.group.enabled = self.enabled.isChecked()
-        if self.custom_hours.isChecked():
-            if not any(box.isChecked() for box in self.group_days):
-                QMessageBox.warning(self, '工作时间', '请至少选择一个工作日。')
-                return
-            if self.group_start.time() >= self.group_end.time():
-                QMessageBox.warning(self, '工作时间', '结束时间必须晚于开始时间。')
-                return
         self.group.is_24x7 = self.round_clock.isChecked()
-        self.group.custom_work_hours_enabled = self.custom_hours.isChecked()
-        self.group.workdays = [i for i, box in enumerate(self.group_days) if box.isChecked()]
-        self.group.work_start_time = self.group_start.time().toString('HH:mm')
-        self.group.work_end_time = self.group_end.time().toString('HH:mm')
         self.group.subscriptions = {
             level: check.isChecked() for level, check in self.level_checks.items()
         }
@@ -638,13 +596,7 @@ class MainWindow(QMainWindow):
         minutes, seconds = divmod(remainder, 60)
         self.uptime.setText(f'本次运行：{hours:02d}:{minutes:02d}:{seconds:02d}')
         try:
-            configured = [g for g in self.db.list_groups() if g.enabled and any(g.subscriptions.values())]
-            if any(group_worktime(g, self.settings.settings) for g in configured):
-                state = '有群组处于工作时间 · 可查询'
-            elif any(g.is_24x7 for g in configured):
-                state = '工作时间外 · 仅 24/7 群组查询'
-            else:
-                state = '所有群组均在工作时间外 · 暂停 API 查询'
+            state = '工作时间 · 常规查询启用' if worktime(self.settings.settings) else '非工作时间 · 仅 24/7 订阅查询'
         except ValueError:
             state = '工作时间配置无效'
         self.work_status.setText(state)
@@ -683,10 +635,7 @@ class MainWindow(QMainWindow):
             cells = (
                 group.display_name,
                 str(sum(bool(value) for value in group.subscriptions.values())),
-                (('24/7 · 跨日提醒 ' if group.is_24x7 else '自定义工作时间 ')
-                 + group.work_start_time + '–' + group.work_end_time
-                 if group.custom_work_hours_enabled else
-                 ('24/7 · 默认时段跨日提醒' if group.is_24x7 else '跟随默认工作时间')),
+                '24/7' if group.is_24x7 else '工作时间',
                 '是' if group.enabled else '否',
             )
             for column, value in enumerate(cells):
