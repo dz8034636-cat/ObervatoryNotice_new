@@ -62,9 +62,6 @@ def theme(scale: float) -> str:
 
 
 def app_icon() -> QIcon:
-    ico_file = Path(__file__).resolve().parent / 'assets' / 'app_icon.ico'
-    if ico_file.is_file():
-        return QIcon(str(ico_file))
     pix = QPixmap(64, 64)
     pix.fill(Qt.transparent)
     painter = QPainter(pix)
@@ -267,7 +264,7 @@ class MainWindow(QMainWindow):
         )
         self.engine = AlertEngine(self.db, self.settings, self.sender)
         self.scheduler = AlertScheduler(self.engine, self.settings, self.events)
-        self.setWindowTitle('HK Weather Alert')
+        self.setWindowTitle('天气警告通知')
         self.setWindowIcon(app_icon())
         self.resize(1060, 760)
         self.setMinimumSize(850, 700)
@@ -504,7 +501,6 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(app_icon(), self)
-        self.tray.setToolTip('HK Weather Alert')
         menu = QMenu(self)
         menu.addAction('显示主窗口', self.restore_window)
         menu.addAction('立即检查', self.check_now)
@@ -985,14 +981,7 @@ class MainWindow(QMainWindow):
 def main() -> int:
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    if os.name == 'nt':
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('HKWeatherAlert.App')
-        except Exception:
-            pass
     app = QApplication(sys.argv)
-    app.setApplicationName('HK Weather Alert')
     app.setStyle('Fusion')
     app.setQuitOnLastWindowClosed(False)
     font = QFont('Segoe UI')

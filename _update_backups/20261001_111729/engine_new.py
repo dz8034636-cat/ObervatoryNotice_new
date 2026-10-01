@@ -208,10 +208,6 @@ class AlertEngine:
                 continue
             if event_type in (EVENT_ISSUE, EVENT_UPGRADE, EVENT_DOWNGRADE):
                 due.append(group)
-            elif last_sent is None and (prior is None or prior['status'] == 'FAILED'):
-                # catch-up: this group never received this warning (new / re-created group),
-                # or the earlier attempt failed (e.g. WhatsApp was logged out)
-                due.append(group)
             elif last_sent and last_sent['send_day'] < today and group_worktime(group, self.settings_manager.settings, check_at):
                 due.append(group)
             # EVENT_UPDATE：无发送。
