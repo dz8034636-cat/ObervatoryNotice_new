@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from storage_tab import StorageTab
+
 from PyQt5.QtCore import Qt, QTime, QTimer, QUrl, QObject, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPixmap, QDesktopServices
 from PyQt5.QtWidgets import (
@@ -26,6 +26,9 @@ from core_new import (
 )
 from engine_new import AlertEngine, AlertScheduler, worktime, group_worktime
 from whatsapp_bridge_client import WhatsAppBridgeClient
+from qr_widgets import QrLabel, QrZoomDialog
+from login_progress import describe as describe_login
+from storage_tab import StorageTab
 
 
 def theme(scale: float) -> str:
@@ -235,6 +238,15 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._restart_required = False
         self._theme_scale = 0.0
+        self._single_check_running = False
+        self._qr_dismissed = False
+        self._qr_pixmap = None
+        self._qr_dialog = None
+        self._login_started = None
+        self._last_status = None
+        self._status_misses = 0
+        self._login_tick = 0
+        self._last_check_text = ''
         s = self.settings.settings
         self.sender = WhatsAppBridgeClient(
             chrome_profile_dir=Path(s.chrome_profile_dir),
@@ -246,7 +258,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('天气警告通知')
         self.setWindowIcon(app_icon())
         self.resize(1060, 760)
-        self.setMinimumSize(850, 630)
+        self.setMinimumSize(850, 700)
         self.build()
         self.setup_tray()
         self.queue_timer = QTimer(self)
@@ -257,6 +269,8 @@ class MainWindow(QMainWindow):
         self.runtime_timer.start(1000)
         self.qr_timer = QTimer(self)
         self.qr_timer.timeout.connect(self.poll_auth)
+        self.login_clock = QTimer(self)
+        self.login_clock.timeout.connect(self.refresh_login_detail)
         self.update_runtime()
         if not minimized:
             self.show()
@@ -325,24 +339,32 @@ class MainWindow(QMainWindow):
         check_button = QPushButton('检查登录')
         check_button.clicked.connect(self.poll_auth)
         top.addWidget(check_button)
+        qr_button = QPushButton('显示二维码')
+        qr_button.clicked.connect(self.reopen_qr_popup)
+        top.addWidget(qr_button)
         wa_layout.addLayout(top)
+        self.login_detail = QLabel('')
+        self.login_detail.setWordWrap(True)
+        self.login_detail.setStyleSheet('color: #667085;')
+        self.login_detail.hide()
+        wa_layout.addWidget(self.login_detail)
         self.qr_box = QWidget()
         qr_line = QHBoxLayout(self.qr_box)
-        self.qr_picture = QLabel('等待二维码…')
-        self.qr_picture.setAlignment(Qt.AlignCenter)
-        self.qr_picture.setMinimumSize(240, 240)
-        qr_line.addWidget(self.qr_picture)
+        self.qr_picture = QrLabel('等待二维码…')
+        qr_line.addWidget(self.qr_picture, 1)
         qr_description = QVBoxLayout()
         note = QLabel('请用 WhatsApp 手机端扫码。\n登录成功后二维码会自动隐藏；\n桥接继续在后台运行。')
         note.setWordWrap(True)
         qr_description.addWidget(note)
+        zoom_button = QPushButton('放大二维码（扫不上时用）')
+        zoom_button.clicked.connect(self.open_qr_zoom)
+        qr_description.addWidget(zoom_button)
         hide_button = QPushButton('隐藏二维码（不退出登录）')
         hide_button.clicked.connect(self.hide_qr)
         qr_description.addWidget(hide_button)
         qr_description.addStretch()
         qr_line.addLayout(qr_description, 1)
-        wa_layout.addWidget(self.qr_box)
-        self.qr_box.hide()
+        self.qr_box.hide()   # the QR code is shown in a pop-up window instead (show_qr_popup)
         main.addWidget(wa_card)
         recent_row = QHBoxLayout()
         recent_row.addWidget(QLabel('最近检查与发送结果'))
@@ -499,22 +521,31 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
             self.minimize_to_tray()
+
     def stop_bridge_for_maintenance(self) -> bool:
+        """Used by the Storage tab before clearing the Chromium cache."""
         if not self.engine._busy.acquire(blocking=False):
             return False
         try:
             self.scheduler.stop()
             self.qr_timer.stop()
+            self.login_clock.stop()
             self.sender.quit()
         finally:
             self.engine._busy.release()
+        self.login_detail.hide()
+        self.login_status.setStyleSheet('')
         self.login_status.setText('桥接已停止（清理缓存）；需要时点击“启动 / 扫码登录”。')
         return True
+
     def exit_app(self) -> None:
         self.scheduler.stop()
         thread = self.scheduler._thread
         if thread is not None and thread.is_alive():
             QMessageBox.warning(self, '仍在发送', '当前检查尚未完成，请稍后再退出。')
+            return
+        if self.engine._busy.locked():
+            QMessageBox.warning(self, '仍在检查', '当前检查或发送尚未完成，请稍后再退出。')
             return
         self.qr_timer.stop()
         try:
@@ -546,8 +577,14 @@ class MainWindow(QMainWindow):
             self.login_status.setText('正在执行一轮查询，请稍后登录。')
             return
         self._loading_bridge = True
+        self._qr_dismissed = False
         self.login_button.setEnabled(False)
         self.login_status.setText('正在启动 WhatsApp 桥接…')
+        self._login_started = time.monotonic()
+        self._last_status = None
+        self._status_misses = 0
+        self.login_clock.start(1000)
+        self.refresh_login_detail()
 
         def boot():
             try:
@@ -565,14 +602,20 @@ class MainWindow(QMainWindow):
             return
         if not self.sender.is_browser_alive():
             self.login_status.setText('桥接未运行；请点击“启动 / 扫码登录”。')
+            self.login_status.setStyleSheet('')
+            self.login_detail.hide()
+            self.login_clock.stop()
             self.qr_timer.stop()
             return
         self._auth_busy = True
 
         def fetch():
-            logged_in = self.sender.is_logged_in(timeout=2)
-            qr = None if logged_in else self.sender.get_login_qr_data_url()
-            return logged_in, qr
+            status = self.sender.get_status_snapshot(timeout=2)
+            logged_in = bool(status) and str(status.get('status', '')).upper() == 'READY'
+            qr = None
+            if status and not logged_in and status.get('has_qr'):
+                qr = self.sender.get_login_qr_data_url()
+            return logged_in, qr, status
         self.run_worker('auth', fetch)
 
     def on_worker_complete(self, kind: str, result: object) -> None:
@@ -580,10 +623,12 @@ class MainWindow(QMainWindow):
             self._loading_bridge = False
             self.login_button.setEnabled(True)
             if isinstance(result, Exception):
+                self.login_clock.stop()
+                self.login_detail.hide()
                 self.login_status.setText(f'桥接启动失败：{type(result).__name__} · {result}')
                 return
             self.login_status.setText('桥接已启动，正在读取登录状态…')
-            self.qr_box.show()
+            # the QR code appears in a pop-up window (see show_qr_popup)
             self.qr_timer.start(3000)
             self.poll_auth()
             return
@@ -592,15 +637,23 @@ class MainWindow(QMainWindow):
             if isinstance(result, Exception):
                 self.login_status.setText(f'登录检查失败：{type(result).__name__} · {result}')
                 return
-            logged_in, data_url = result
+            logged_in, data_url, status = result
+            self._last_status = status
+            self._status_misses = 0 if status else self._status_misses + 1
+            self._last_check_text = datetime.now().strftime('%H:%M:%S')
+            self.refresh_login_detail()
             if logged_in:
+                self.login_clock.stop()
+                self.login_detail.hide()
                 self.login_status.setText('WhatsApp 已登录 · 桥接在后台运行')
+                self.login_status.setStyleSheet('color: #15803d; font-weight: 600;')
                 self.qr_timer.stop()
                 self.qr_box.hide()
+                if self._qr_dialog is not None:
+                    self._qr_dialog.close()
                 if self.settings.settings.auto_start_monitor and not self._restart_required:
                     self.scheduler.start()
                 return
-            self.login_status.setText('等待扫码登录')
             if not data_url:
                 self.qr_picture.setText('二维码准备中，请稍候…')
                 return
@@ -611,10 +664,11 @@ class MainWindow(QMainWindow):
                 pix = QPixmap()
                 if not pix.loadFromData(image_bytes):
                     raise ValueError('无法解码二维码图片')
-                self.qr_picture.setPixmap(
-                    pix.scaled(250, 250, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                )
-                self.qr_box.show()
+                self._qr_pixmap = pix
+                self.qr_picture.set_source(pix)
+                if self._qr_dialog is not None and self._qr_dialog.isVisible():
+                    self._qr_dialog.set_source(pix)
+                self.show_qr_popup(pix)
             except Exception as exc:
                 self.qr_picture.setText(f'二维码显示失败：{exc}')
             return
@@ -628,7 +682,62 @@ class MainWindow(QMainWindow):
             })
             self.group_hint.setText(f'已读取 {len(self.names)} 个群组，可在新增／编辑窗口选择。')
 
+    def refresh_login_detail(self) -> None:
+        if self._login_started is None:
+            return
+        self._login_tick += 1
+        view = describe_login(
+            self._last_status,
+            elapsed=time.monotonic() - self._login_started,
+            misses=self._status_misses,
+            tick=self._login_tick,
+            checked_at=self._last_check_text,
+            bridge_starting=self._loading_bridge,
+        )
+        color = {'ok': '#15803d', 'info': '#2563eb', 'warn': '#b45309', 'error': '#b91c1c'}[view.level]
+        self.login_status.setText(view.headline)
+        self.login_status.setStyleSheet(f'color: {color}; font-weight: 600;')
+        self.login_detail.setText(view.detail)
+        self.login_detail.setVisible(bool(view.detail))
+
+    def open_qr_zoom(self) -> None:
+        if self._qr_pixmap is None:
+            QMessageBox.information(self, '二维码', '二维码还没有生成，请稍候。')
+            return
+        if self._qr_dialog is None:
+            self._qr_dialog = QrZoomDialog(self)
+        self._qr_dialog.set_source(self._qr_pixmap)
+        self._qr_dialog.show()
+        self._qr_dialog.raise_()
+        self._qr_dialog.activateWindow()
+
+    def show_qr_popup(self, pix) -> None:
+        """Show / refresh the login QR code in a pop-up window."""
+        self._qr_pixmap = pix
+        if self._qr_dialog is None:
+            self._qr_dialog = QrZoomDialog(self)
+            self._qr_dialog.finished.connect(self._on_qr_popup_closed)
+        self._qr_dialog.set_source(pix)
+        if self._qr_dialog.isVisible() or self._qr_dismissed:
+            return
+        self._qr_dialog.show()
+        self._qr_dialog.raise_()
+        self._qr_dialog.activateWindow()
+
+    def _on_qr_popup_closed(self, _result: int) -> None:
+        self._qr_dismissed = True
+
+    def reopen_qr_popup(self) -> None:
+        if self._qr_pixmap is None:
+            QMessageBox.information(self, '二维码', '二维码还没有生成，请稍候（可看上方的登录进度）。')
+            return
+        self._qr_dismissed = False
+        self.show_qr_popup(self._qr_pixmap)
+        self._qr_dialog.raise_()
+        self._qr_dialog.activateWindow()
+
     def hide_qr(self) -> None:
+        self.login_clock.stop()
         self.qr_box.hide()
         self.qr_timer.stop()
         self.login_status.setText('二维码已隐藏；桥接仍在运行。点击检查登录可刷新状态。')
@@ -650,7 +759,30 @@ class MainWindow(QMainWindow):
         if not self.settings.settings.dry_run_mode and not self.sender.is_logged_in(timeout=2):
             self.login_status.setText('请先完成 WhatsApp 登录。')
             return
-        self.scheduler.trigger_immediate_check()
+        self.run_single_check()
+
+    def run_single_check(self) -> None:
+        """One poll cycle on its own thread. Does NOT start, resume or reschedule monitoring."""
+        if self._single_check_running:
+            self.recent.append('上一次手动检查仍在进行，请稍候。')
+            return
+        self._single_check_running = True
+        emit = self.scheduler._emit
+        emit('progress', '手动检查一次（不会启动或恢复监控）')
+
+        def work() -> None:
+            try:
+                emit('check_started', None)
+                summary = self.engine.run_one_poll_cycle(lambda text: emit('progress', text))
+                emit('check_completed', summary)
+            except Exception as exc:
+                import logging
+                logging.getLogger('hko_alert').exception('手动检查失败')
+                emit('check_error', str(exc))
+            finally:
+                self._single_check_running = False
+
+        threading.Thread(target=work, name='manual-check', daemon=True).start()
 
     def toggle_monitor(self) -> None:
         if self.scheduler._paused.is_set():
