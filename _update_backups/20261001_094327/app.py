@@ -365,13 +365,7 @@ class MainWindow(QMainWindow):
         qr_line.addLayout(qr_description, 1)
         self.qr_box.hide()   # the QR code is shown in a pop-up window instead (show_qr_popup)
         main.addWidget(wa_card)
-        recent_row = QHBoxLayout()
-        recent_row.addWidget(QLabel('最近检查与发送结果'))
-        recent_row.addStretch()
-        clear_recent_button = QPushButton('清除运行信息')
-        clear_recent_button.clicked.connect(lambda: self.recent.clear())
-        recent_row.addWidget(clear_recent_button)
-        main.addLayout(recent_row)
+        main.addWidget(QLabel('最近检查与发送结果'))
         self.recent = QTextEdit()
         self.recent.setReadOnly(True)
         main.addWidget(self.recent, 1)
@@ -417,12 +411,6 @@ class MainWindow(QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_logs_dir())))
         )
         hb.addWidget(log_button)
-        clear_view_button = QPushButton('清除记录显示')
-        clear_view_button.clicked.connect(self.clear_history_view)
-        hb.addWidget(clear_view_button)
-        purge_button = QPushButton('删除旧记录（保留最近3天）')
-        purge_button.clicked.connect(self.purge_old_history)
-        hb.addWidget(purge_button)
         hb.addStretch()
         hl.addLayout(hb)
         self.refresh_history()
@@ -866,27 +854,6 @@ class MainWindow(QMainWindow):
                 self.engine._busy.release()
         self.group_hint.setText('正在从 WhatsApp 读取群组…')
         self.run_worker('groups', fetch)
-
-    def clear_history_view(self) -> None:
-        answer = QMessageBox.question(
-            self, '清除记录显示',
-            '只清空"记录"页的显示，不会删除数据库记录，'
-            '也不影响去重和跨日重发。是否继续？')
-        if answer == QMessageBox.Yes:
-            self.db.clear_history_view()
-            self.refresh_history()
-
-    def purge_old_history(self) -> None:
-        answer = QMessageBox.question(
-            self, '删除旧记录',
-            '将永久删除 3 天前的投递记录，保留最近 3 天'
-            '（跨日重发需要昨天的记录）。此操作不可恢复，是否继续？')
-        if answer != QMessageBox.Yes:
-            return
-        deliveries, daily = self.db.purge_old_records(keep_days=3)
-        self.refresh_history()
-        QMessageBox.information(
-            self, '已删除', f'已删除投递记录 {deliveries} 条、每日发送记录 {daily} 条。')
 
     def refresh_history(self) -> None:
         records = self.db.recent_deliveries()

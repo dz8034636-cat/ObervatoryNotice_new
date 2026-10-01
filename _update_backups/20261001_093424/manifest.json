@@ -1,0 +1,9 @@
+{
+  "backed_up": [
+    "app.py"
+  ],
+  "created": [
+    "qr_sizing.py",
+    "qr_widgets.py"
+  ]
+}

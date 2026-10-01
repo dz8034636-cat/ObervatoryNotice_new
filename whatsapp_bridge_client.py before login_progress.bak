@@ -213,21 +213,7 @@ class WhatsAppBridgeClient:
             return None
         payload = self._read_status(self.port, timeout)
         if payload:
-            self._log_status_change(payload)
-        return payload
-
-    def _log_status_change(self, payload: dict) -> None:
-        key = (payload.get('status'), payload.get('detail'), payload.get('has_qr'))
-        if key != getattr(self, '_last_status_key', None):
-            self._last_status_key = key
-            logger.info('Bridge 状态变化：port=%s payload=%s', self.port, payload)
-
-    def get_status_snapshot(self, timeout: float = 2) -> Optional[dict]:
-        if self.dry_run or not self.port:
-            return None
-        payload = self._read_status(self.port, timeout)
-        if payload:
-            self._log_status_change(payload)
+            logger.info('Bridge 状态回传：port=%s payload=%s', self.port, payload)
         return payload
 
     def is_logged_in(self, timeout: int = 15) -> bool:

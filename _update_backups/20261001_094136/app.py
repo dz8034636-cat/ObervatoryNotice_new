@@ -238,7 +238,6 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._restart_required = False
         self._theme_scale = 0.0
-        self._qr_dismissed = False
         self._qr_pixmap = None
         self._qr_dialog = None
         self._login_started = None
@@ -338,9 +337,6 @@ class MainWindow(QMainWindow):
         check_button = QPushButton('检查登录')
         check_button.clicked.connect(self.poll_auth)
         top.addWidget(check_button)
-        qr_button = QPushButton('显示二维码')
-        qr_button.clicked.connect(self.reopen_qr_popup)
-        top.addWidget(qr_button)
         wa_layout.addLayout(top)
         self.login_detail = QLabel('')
         self.login_detail.setWordWrap(True)
@@ -363,15 +359,10 @@ class MainWindow(QMainWindow):
         qr_description.addWidget(hide_button)
         qr_description.addStretch()
         qr_line.addLayout(qr_description, 1)
-        self.qr_box.hide()   # the QR code is shown in a pop-up window instead (show_qr_popup)
+        wa_layout.addWidget(self.qr_box)
+        self.qr_box.hide()
         main.addWidget(wa_card)
-        recent_row = QHBoxLayout()
-        recent_row.addWidget(QLabel('最近检查与发送结果'))
-        recent_row.addStretch()
-        clear_recent_button = QPushButton('清除运行信息')
-        clear_recent_button.clicked.connect(lambda: self.recent.clear())
-        recent_row.addWidget(clear_recent_button)
-        main.addLayout(recent_row)
+        main.addWidget(QLabel('最近检查与发送结果'))
         self.recent = QTextEdit()
         self.recent.setReadOnly(True)
         main.addWidget(self.recent, 1)
@@ -417,12 +408,6 @@ class MainWindow(QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_logs_dir())))
         )
         hb.addWidget(log_button)
-        clear_view_button = QPushButton('清除记录显示')
-        clear_view_button.clicked.connect(self.clear_history_view)
-        hb.addWidget(clear_view_button)
-        purge_button = QPushButton('删除旧记录（保留最近3天）')
-        purge_button.clicked.connect(self.purge_old_history)
-        hb.addWidget(purge_button)
         hb.addStretch()
         hl.addLayout(hb)
         self.refresh_history()
@@ -573,7 +558,6 @@ class MainWindow(QMainWindow):
             self.login_status.setText('正在执行一轮查询，请稍后登录。')
             return
         self._loading_bridge = True
-        self._qr_dismissed = False
         self.login_button.setEnabled(False)
         self.login_status.setText('正在启动 WhatsApp 桥接…')
         self._login_started = time.monotonic()
@@ -624,7 +608,7 @@ class MainWindow(QMainWindow):
                 self.login_status.setText(f'桥接启动失败：{type(result).__name__} · {result}')
                 return
             self.login_status.setText('桥接已启动，正在读取登录状态…')
-            # the QR code appears in a pop-up window (see show_qr_popup)
+            self.qr_box.show()
             self.qr_timer.start(3000)
             self.poll_auth()
             return
@@ -664,7 +648,7 @@ class MainWindow(QMainWindow):
                 self.qr_picture.set_source(pix)
                 if self._qr_dialog is not None and self._qr_dialog.isVisible():
                     self._qr_dialog.set_source(pix)
-                self.show_qr_popup(pix)
+                self.qr_box.show()
             except Exception as exc:
                 self.qr_picture.setText(f'二维码显示失败：{exc}')
             return
@@ -704,31 +688,6 @@ class MainWindow(QMainWindow):
             self._qr_dialog = QrZoomDialog(self)
         self._qr_dialog.set_source(self._qr_pixmap)
         self._qr_dialog.show()
-        self._qr_dialog.raise_()
-        self._qr_dialog.activateWindow()
-
-    def show_qr_popup(self, pix) -> None:
-        """Show / refresh the login QR code in a pop-up window."""
-        self._qr_pixmap = pix
-        if self._qr_dialog is None:
-            self._qr_dialog = QrZoomDialog(self)
-            self._qr_dialog.finished.connect(self._on_qr_popup_closed)
-        self._qr_dialog.set_source(pix)
-        if self._qr_dialog.isVisible() or self._qr_dismissed:
-            return
-        self._qr_dialog.show()
-        self._qr_dialog.raise_()
-        self._qr_dialog.activateWindow()
-
-    def _on_qr_popup_closed(self, _result: int) -> None:
-        self._qr_dismissed = True
-
-    def reopen_qr_popup(self) -> None:
-        if self._qr_pixmap is None:
-            QMessageBox.information(self, '二维码', '二维码还没有生成，请稍候（可看上方的登录进度）。')
-            return
-        self._qr_dismissed = False
-        self.show_qr_popup(self._qr_pixmap)
         self._qr_dialog.raise_()
         self._qr_dialog.activateWindow()
 
@@ -866,27 +825,6 @@ class MainWindow(QMainWindow):
                 self.engine._busy.release()
         self.group_hint.setText('正在从 WhatsApp 读取群组…')
         self.run_worker('groups', fetch)
-
-    def clear_history_view(self) -> None:
-        answer = QMessageBox.question(
-            self, '清除记录显示',
-            '只清空"记录"页的显示，不会删除数据库记录，'
-            '也不影响去重和跨日重发。是否继续？')
-        if answer == QMessageBox.Yes:
-            self.db.clear_history_view()
-            self.refresh_history()
-
-    def purge_old_history(self) -> None:
-        answer = QMessageBox.question(
-            self, '删除旧记录',
-            '将永久删除 3 天前的投递记录，保留最近 3 天'
-            '（跨日重发需要昨天的记录）。此操作不可恢复，是否继续？')
-        if answer != QMessageBox.Yes:
-            return
-        deliveries, daily = self.db.purge_old_records(keep_days=3)
-        self.refresh_history()
-        QMessageBox.information(
-            self, '已删除', f'已删除投递记录 {deliveries} 条、每日发送记录 {daily} 条。')
 
     def refresh_history(self) -> None:
         records = self.db.recent_deliveries()
