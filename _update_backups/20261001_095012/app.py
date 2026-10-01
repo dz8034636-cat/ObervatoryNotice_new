@@ -238,7 +238,6 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._restart_required = False
         self._theme_scale = 0.0
-        self._single_check_running = False
         self._qr_dismissed = False
         self._qr_pixmap = None
         self._qr_dialog = None
@@ -544,9 +543,6 @@ class MainWindow(QMainWindow):
         if thread is not None and thread.is_alive():
             QMessageBox.warning(self, '仍在发送', '当前检查尚未完成，请稍后再退出。')
             return
-        if self.engine._busy.locked():
-            QMessageBox.warning(self, '仍在检查', '当前检查或发送尚未完成，请稍后再退出。')
-            return
         self.qr_timer.stop()
         try:
             self.sender.quit()
@@ -759,30 +755,7 @@ class MainWindow(QMainWindow):
         if not self.settings.settings.dry_run_mode and not self.sender.is_logged_in(timeout=2):
             self.login_status.setText('请先完成 WhatsApp 登录。')
             return
-        self.run_single_check()
-
-    def run_single_check(self) -> None:
-        """One poll cycle on its own thread. Does NOT start, resume or reschedule monitoring."""
-        if self._single_check_running:
-            self.recent.append('上一次手动检查仍在进行，请稍候。')
-            return
-        self._single_check_running = True
-        emit = self.scheduler._emit
-        emit('progress', '手动检查一次（不会启动或恢复监控）')
-
-        def work() -> None:
-            try:
-                emit('check_started', None)
-                summary = self.engine.run_one_poll_cycle(lambda text: emit('progress', text))
-                emit('check_completed', summary)
-            except Exception as exc:
-                import logging
-                logging.getLogger('hko_alert').exception('手动检查失败')
-                emit('check_error', str(exc))
-            finally:
-                self._single_check_running = False
-
-        threading.Thread(target=work, name='manual-check', daemon=True).start()
+        self.scheduler.trigger_immediate_check()
 
     def toggle_monitor(self) -> None:
         if self.scheduler._paused.is_set():
